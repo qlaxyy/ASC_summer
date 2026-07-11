@@ -1,0 +1,14 @@
+# Core runtime used for the ASC pipeline.
+# Install the PyTorch wheel appropriate for the AutoDL CUDA environment first;
+# then install this file with: pip install -r requirements.txt
+torch==2.5.1
+transformers==4.50.1
+datasets==3.2.0
+accelerate==0.26.0
+numpy==1.26.4
+tqdm>=4.66,<5
+sympy>=1.13,<1.14
+openai>=1.0,<2
+
+# Optional: install a CUDA/Python-compatible flash-attn wheel separately when
+# using --attn_impl flash_attention_2. It is intentionally not pinned here.

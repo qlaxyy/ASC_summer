@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local data and generated model artifacts (do not commit)
+datasets/
+vectors/*.pt
+vectors/*.pth
+vectors/*.bin
+*.safetensors
+*.ckpt
+
+# Large per-sample evaluation artifacts; retain curated Markdown summaries.
+results/**/*.json
+results/*.json
+results/**/*.tmp
+*.tmp
+
+# Credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
