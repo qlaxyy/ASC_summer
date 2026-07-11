@@ -9,9 +9,7 @@ __pycache__/
 venv/
 env/
 
-# Local data and generated model artifacts (do not commit)
-datasets/
-vectors/*.pt
+# Large model artifacts (do not commit)
 vectors/*.pth
 vectors/*.bin
 *.safetensors

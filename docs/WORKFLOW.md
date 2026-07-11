@@ -25,8 +25,9 @@ python -m pip install -r requirements.txt
 # 如需 FlashAttention，请按当前 CUDA、PyTorch、Python 版本安装匹配 wheel。
 ```
 
-模型权重、原始数据、私钥和 API key 不提交 Git。数据可通过 `download_datasets.py` 准备；
-向量在 AutoDL 生成并保留在 `vectors/`。它们默认被 `.gitignore` 忽略。
+模型权重、私钥和 API key 不提交 Git。当前阶段的 GSM8K/MATH 数据集和已有 steering vector
+体积较小，纳入 Git 以便新服务器直接拉取；后续新增的大型模型权重或向量仍应使用 Git LFS
+或外部存储。
 
 ## 运行实验
 
