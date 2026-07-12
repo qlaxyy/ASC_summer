@@ -390,7 +390,14 @@ def load_steering_vector(path: str) -> torch.Tensor:
     return steering_vec_cpu
 
 
-def make_cached_steering_hook(steering_vec_cpu: torch.Tensor, gamma: float):
+def make_cached_steering_hook(
+    steering_vec_cpu: torch.Tensor,
+    gamma: float,
+    injection_sign: str,
+):
+    if injection_sign not in {"add", "subtract"}:
+        raise ValueError(f"Unsupported injection_sign: {injection_sign}")
+    multiplier = 1.0 if injection_sign == "add" else -1.0
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
     def add_steer(_, __, output):
@@ -401,7 +408,7 @@ def make_cached_steering_hook(steering_vec_cpu: torch.Tensor, gamma: float):
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        hidden[:, -1, :] = target - gamma * steering_vec
+        hidden[:, -1, :] = target + multiplier * gamma * steering_vec
         return (hidden, *output[1:])
 
     return add_steer
@@ -560,7 +567,11 @@ def evaluate_gamma(
             raise ValueError("Nonzero gamma requires a steering vector.")
         layers = get_transformer_layers(model)
         handle = layers[layer_index].register_forward_hook(
-            make_cached_steering_hook(steering_vec_cpu, gamma)
+            make_cached_steering_hook(
+                steering_vec_cpu,
+                gamma,
+                args.injection_sign,
+            )
         )
 
     total = len(samples)
@@ -749,6 +760,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--layer_index", type=int, default=None)
+    parser.add_argument(
+        "--injection_sign",
+        choices=["add", "subtract"],
+        default=None,
+        help=(
+            "Required for nonzero gamma. Use add for paper-convention vectors "
+            "(short-minus-long), and subtract for the released author vectors "
+            "or explicitly long-minus-short vectors."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=-1)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -918,6 +939,12 @@ def main() -> None:
             "Nonzero gamma requires --layer_index. For new models, use the same "
             "layer used by extract_steering_vector.py."
         )
+    if needs_steering_vector and args.injection_sign is None:
+        raise ValueError(
+            "Nonzero gamma requires --injection_sign. Use `add` for a "
+            "short-minus-long vector extracted according to the paper, or "
+            "`subtract` for the released author vectors/long-minus-short vectors."
+        )
     model_alias = args.file_model_alias or model_alias_from_name(args.model_name)
 
     args.resolved_device_map = resolve_device_map(args)
@@ -942,6 +969,7 @@ def main() -> None:
     if needs_steering_vector:
         print(f"  vector:         {args.steering_vector_path}")
         print(f"  layer:          {args.layer_index}")
+        print(f"  injection sign: {args.injection_sign}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)

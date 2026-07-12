@@ -116,6 +116,15 @@ def main() -> None:
         "model_name": args.model_name,
         "layer_index": layer_index,
         "direction": args.direction,
+        "paper_direction": "short_minus_long",
+        "recommended_injection_sign": (
+            "add" if args.direction == "short_minus_long" else "subtract"
+        ),
+        "formula": (
+            "v = h(short) - h(long); h <- h + gamma*v"
+            if args.direction == "short_minus_long"
+            else "v = h(long) - h(short); h <- h - gamma*v"
+        ),
         "text_mode": "long_prompt+cot",
         "num_vectors": int(vectors.shape[0]),
         "hidden_size": int(vectors.shape[1]),
