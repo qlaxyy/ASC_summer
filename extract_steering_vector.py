@@ -50,6 +50,16 @@ def parse_args() -> argparse.Namespace:
         choices=["short_minus_long", "long_minus_short"],
         default="short_minus_long",
     )
+    parser.add_argument(
+        "--activation_site",
+        choices=["block_input", "block_output"],
+        default="block_input",
+        help=(
+            "Residual-stream location to read. block_input matches ActAdd/CAST "
+            "pre-hook implementations and must be paired with the same "
+            "--injection_site during evaluation."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--max_memory", type=str, default=None)
@@ -90,6 +100,7 @@ def main() -> None:
     print(f"  samples:     {len(pairs)}")
     print(f"  layer:       {layer_index}")
     print(f"  direction:   {args.direction}")
+    print(f"  site:        {args.activation_site}")
     print("  text mode:   long_prompt + cot")
     print(f"  input device:{input_device}")
     if hasattr(model, "hf_device_map"):
@@ -104,6 +115,7 @@ def main() -> None:
         max_input_tokens=args.max_input_tokens,
         activation_batch_size=args.activation_batch_size,
         direction=args.direction,
+        activation_site=args.activation_site,
     )
 
     output_vector = Path(args.output_vector_path)
@@ -111,11 +123,16 @@ def main() -> None:
     torch.save(vectors, output_vector)
 
     norms = vectors.norm(dim=1)
+    mean_vector = vectors.mean(dim=0)
+    mean_vector_norm = mean_vector.norm().clamp_min(1e-12)
+    pair_projection_margins = vectors @ (mean_vector / mean_vector_norm)
     first_pair = pairs[0]
     metadata = {
         "model_name": args.model_name,
         "layer_index": layer_index,
         "direction": args.direction,
+        "activation_site": args.activation_site,
+        "matching_injection_site": args.activation_site,
         "paper_direction": "short_minus_long",
         "recommended_injection_sign": (
             "add" if args.direction == "short_minus_long" else "subtract"
@@ -132,7 +149,13 @@ def main() -> None:
         "vector_norm_median": float(norms.median().item()),
         "vector_norm_min": float(norms.min().item()),
         "vector_norm_max": float(norms.max().item()),
-        "mean_vector_norm": float(vectors.mean(dim=0).norm().item()),
+        "mean_vector_norm": float(mean_vector.norm().item()),
+        "orientation_pair_agreement": float(
+            (pair_projection_margins > 0).float().mean().item()
+        ),
+        "mean_pair_projection_margin": float(
+            pair_projection_margins.mean().item()
+        ),
         "pairs_path": str(pairs_path),
         "long_source": str(first_pair.get("long_source") or "unknown"),
         "short_source": str(first_pair.get("short_source") or "unknown"),

@@ -390,7 +390,100 @@ def load_steering_vector(path: str) -> torch.Tensor:
     return steering_vec_cpu
 
 
-def make_cached_steering_hook(
+def load_and_validate_vector_metadata(
+    vector_path: str,
+    injection_sign: str,
+    injection_site: str,
+    allow_mismatch: bool,
+) -> dict[str, Any] | None:
+    metadata_path = Path(vector_path + ".metadata.json")
+    if not metadata_path.exists():
+        return None
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expected_sign = metadata.get("recommended_injection_sign")
+    expected_site = metadata.get("matching_injection_site") or metadata.get(
+        "activation_site"
+    )
+    mismatches = []
+    if expected_sign and expected_sign != injection_sign:
+        mismatches.append(
+            f"injection_sign={injection_sign!r}, metadata expects {expected_sign!r}"
+        )
+    if expected_site and expected_site != injection_site:
+        mismatches.append(
+            f"injection_site={injection_site!r}, metadata expects {expected_site!r}"
+        )
+    if mismatches and not allow_mismatch:
+        raise ValueError(
+            "Steering vector metadata mismatch: "
+            + "; ".join(mismatches)
+            + ". Pass --allow_vector_metadata_mismatch only for a deliberate "
+            "diagnostic experiment."
+        )
+    return metadata
+
+
+def save_causally_oriented_vector(
+    steering_vec_cpu: torch.Tensor,
+    gamma_results: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[Path, dict[str, Any]]:
+    if args.injection_sign != "add":
+        raise ValueError(
+            "Causal orientation requires --injection_sign add and signed gamma "
+            "candidates. The saved vector is always intended for positive add."
+        )
+    baselines = [row for row in gamma_results if abs(row["gamma"]) <= 1e-12]
+    if not baselines:
+        raise ValueError("Causal orientation requires a gamma=0 baseline.")
+    baseline = baselines[0]
+    eligible = [
+        row
+        for row in gamma_results
+        if abs(row["gamma"]) > 1e-12
+        and row["accuracy"]
+        >= baseline["accuracy"] - args.orientation_accuracy_tolerance
+        and row["avg_tokens"] < baseline["avg_tokens"]
+    ]
+    if not eligible:
+        raise RuntimeError(
+            "No signed gamma produced compression within the configured accuracy "
+            "tolerance; refusing to label either sign as a compression vector."
+        )
+    selected = min(
+        eligible,
+        key=lambda row: (row["avg_tokens"], -row["accuracy"], abs(row["gamma"])),
+    )
+    orientation_multiplier = 1.0 if selected["gamma"] > 0 else -1.0
+    oriented = steering_vec_cpu * orientation_multiplier
+    output_path = Path(args.orient_vector_output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(oriented, output_path)
+    metadata = {
+        "vector_type": "causally_oriented_compression",
+        "base_vector_path": str(args.steering_vector_path),
+        "orientation_multiplier": orientation_multiplier,
+        "selected_signed_gamma": float(selected["gamma"]),
+        "recommended_positive_gamma": abs(float(selected["gamma"])),
+        "recommended_injection_sign": "add",
+        "activation_site": args.injection_site,
+        "matching_injection_site": args.injection_site,
+        "calibration_dataset": args.dataset,
+        "calibration_data_path": args.local_data_path,
+        "calibration_samples": int(selected["total"]),
+        "accuracy_tolerance": float(args.orientation_accuracy_tolerance),
+        "baseline": strip_details_for_summary(baseline),
+        "selected": strip_details_for_summary(selected),
+        "candidate_results": [
+            strip_details_for_summary(row) for row in gamma_results
+        ],
+        "formula": "v_compress = orientation_multiplier * v_base; h <- h + gamma*v_compress",
+    }
+    write_json_atomic(str(output_path) + ".metadata.json", metadata)
+    return output_path, metadata
+
+
+def make_cached_output_steering_hook(
     steering_vec_cpu: torch.Tensor,
     gamma: float,
     injection_sign: str,
@@ -410,6 +503,30 @@ def make_cached_steering_hook(
             cache[key] = steering_vec
         hidden[:, -1, :] = target + multiplier * gamma * steering_vec
         return (hidden, *output[1:])
+
+    return add_steer
+
+
+def make_cached_input_steering_hook(
+    steering_vec_cpu: torch.Tensor,
+    gamma: float,
+    injection_sign: str,
+):
+    if injection_sign not in {"add", "subtract"}:
+        raise ValueError(f"Unsupported injection_sign: {injection_sign}")
+    multiplier = 1.0 if injection_sign == "add" else -1.0
+    cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+    def add_steer(_module, inputs):
+        hidden = inputs[0]
+        target = hidden[:, -1, :]
+        key = (str(target.device), target.dtype)
+        steering_vec = cache.get(key)
+        if steering_vec is None:
+            steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
+            cache[key] = steering_vec
+        hidden[:, -1, :] = target + multiplier * gamma * steering_vec
+        return (hidden, *inputs[1:])
 
     return add_steer
 
@@ -566,13 +683,24 @@ def evaluate_gamma(
         if steering_vec_cpu is None:
             raise ValueError("Nonzero gamma requires a steering vector.")
         layers = get_transformer_layers(model)
-        handle = layers[layer_index].register_forward_hook(
-            make_cached_steering_hook(
-                steering_vec_cpu,
-                gamma,
-                args.injection_sign,
+        if args.injection_site == "block_input":
+            handle = layers[layer_index].register_forward_pre_hook(
+                make_cached_input_steering_hook(
+                    steering_vec_cpu,
+                    gamma,
+                    args.injection_sign,
+                )
             )
-        )
+        elif args.injection_site == "block_output":
+            handle = layers[layer_index].register_forward_hook(
+                make_cached_output_steering_hook(
+                    steering_vec_cpu,
+                    gamma,
+                    args.injection_sign,
+                )
+            )
+        else:
+            raise ValueError(f"Unknown injection_site: {args.injection_site}")
 
     total = len(samples)
     run_metrics: list[dict[str, Any]] = []
@@ -770,6 +898,36 @@ def parse_args() -> argparse.Namespace:
             "or explicitly long-minus-short vectors."
         ),
     )
+    parser.add_argument(
+        "--injection_site",
+        choices=["block_input", "block_output"],
+        default=None,
+        help=(
+            "Required for nonzero gamma. It must match the activation_site used "
+            "to extract the vector. New vectors should use block_input; "
+            "block_output is retained for legacy ASC vectors."
+        ),
+    )
+    parser.add_argument(
+        "--allow_vector_metadata_mismatch",
+        action="store_true",
+        help="Allow a deliberate sign/site mismatch with vector sidecar metadata.",
+    )
+    parser.add_argument(
+        "--orient_vector_output_path",
+        type=str,
+        default=None,
+        help=(
+            "After a signed-gamma sweep including gamma=0, save the empirically "
+            "compressive orientation as a new vector intended for positive add."
+        ),
+    )
+    parser.add_argument(
+        "--orientation_accuracy_tolerance",
+        type=float,
+        default=0.02,
+        help="Maximum absolute accuracy drop allowed during causal orientation.",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=-1)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -945,6 +1103,13 @@ def main() -> None:
             "short-minus-long vector extracted according to the paper, or "
             "`subtract` for the released author vectors/long-minus-short vectors."
         )
+    if needs_steering_vector and args.injection_site is None:
+        raise ValueError(
+            "Nonzero gamma requires --injection_site. Use the same site recorded "
+            "in the vector metadata; new ActAdd-aligned vectors use block_input."
+        )
+    if args.orientation_accuracy_tolerance < 0:
+        raise ValueError("--orientation_accuracy_tolerance must be nonnegative.")
     model_alias = args.file_model_alias or model_alias_from_name(args.model_name)
 
     args.resolved_device_map = resolve_device_map(args)
@@ -970,6 +1135,7 @@ def main() -> None:
         print(f"  vector:         {args.steering_vector_path}")
         print(f"  layer:          {args.layer_index}")
         print(f"  injection sign: {args.injection_sign}")
+        print(f"  injection site: {args.injection_site}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)
@@ -1013,10 +1179,23 @@ def main() -> None:
     print(f"  samples:        {len(samples)}")
 
     steering_vec_cpu = None
+    vector_metadata = None
     if needs_steering_vector:
         print("[4/4] Loading steering vector and running gammas")
+        vector_metadata = load_and_validate_vector_metadata(
+            args.steering_vector_path,
+            args.injection_sign,
+            args.injection_site,
+            args.allow_vector_metadata_mismatch,
+        )
         steering_vec_cpu = load_steering_vector(args.steering_vector_path)
         print(f"  vector norm:    {float(steering_vec_cpu.norm().item()):.6f}")
+        if vector_metadata is not None:
+            print(
+                "  vector metadata: "
+                f"direction={vector_metadata.get('direction') or vector_metadata.get('vector_type')}, "
+                f"site={vector_metadata.get('activation_site')}"
+            )
     else:
         print("[4/4] Running gammas")
 
@@ -1129,6 +1308,24 @@ def main() -> None:
     if stopped_early:
         print(f"  stopped early:  {stop_reason}")
     print("=" * 72)
+
+    if args.orient_vector_output_path is not None:
+        if steering_vec_cpu is None:
+            raise ValueError("--orient_vector_output_path requires a steering vector.")
+        oriented_path, oriented_metadata = save_causally_oriented_vector(
+            steering_vec_cpu,
+            gamma_results,
+            args,
+        )
+        print(f"Saved causally oriented vector to {oriented_path}")
+        print(
+            "  orientation multiplier: "
+            f"{oriented_metadata['orientation_multiplier']:+.0f}"
+        )
+        print(
+            "  recommended positive gamma: "
+            f"{oriented_metadata['recommended_positive_gamma']:.6g}"
+        )
 
     if args.write_grid_summary and multi_gamma:
         output = {

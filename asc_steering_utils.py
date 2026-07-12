@@ -671,6 +671,7 @@ def last_token_activations(
     layer_index: int,
     max_input_tokens: int,
     batch_size: int,
+    activation_site: str,
 ) -> torch.Tensor:
     activations: list[torch.Tensor] = []
     old_truncation_side = tokenizer.truncation_side
@@ -687,10 +688,26 @@ def last_token_activations(
         for batch in tqdm(iter_batches(texts, batch_size), desc="Extracting activations"):
             captured: list[torch.Tensor] = []
 
-            def capture_hook(_module: Any, _inputs: Any, output: Any) -> None:
-                captured.append(first_tensor(output)[:, -1].detach().float().cpu())
+            if activation_site == "block_input":
+                def capture_hook(_module: Any, hook_inputs: Any) -> None:
+                    captured.append(
+                        first_tensor(hook_inputs)[:, -1].detach().float().cpu()
+                    )
 
-            handle = layers[layer_index].register_forward_hook(capture_hook)
+                handle = layers[layer_index].register_forward_pre_hook(capture_hook)
+            elif activation_site == "block_output":
+                def capture_hook(
+                    _module: Any,
+                    _inputs: Any,
+                    output: Any,
+                ) -> None:
+                    captured.append(
+                        first_tensor(output)[:, -1].detach().float().cpu()
+                    )
+
+                handle = layers[layer_index].register_forward_hook(capture_hook)
+            else:
+                raise ValueError(f"Unknown activation_site: {activation_site}")
             inputs = tokenizer(
                 batch,
                 return_tensors="pt",
@@ -730,6 +747,7 @@ def extract_vectors(
     max_input_tokens: int,
     activation_batch_size: int,
     direction: str,
+    activation_site: str,
 ) -> torch.Tensor:
     short_texts: list[str] = []
     long_texts: list[str] = []
@@ -746,6 +764,7 @@ def extract_vectors(
         layer_index,
         max_input_tokens,
         activation_batch_size,
+        activation_site,
     )
     long_acts = last_token_activations(
         model,
@@ -755,6 +774,7 @@ def extract_vectors(
         layer_index,
         max_input_tokens,
         activation_batch_size,
+        activation_site,
     )
     if direction == "short_minus_long":
         return short_acts - long_acts

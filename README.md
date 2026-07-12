@@ -204,3 +204,14 @@ extract_paper_kl_gamma.py
 3. **研究加速推理与 ASC 注入的结合**
 
    当前 `gamma=0` baseline 可以使用 vLLM 加速，但非零 gamma 仍依赖 transformers 的中间层 hook。后续需要研究 activation steering 的引导向量注入是否能在 vLLM 或类似高吞吐推理框架中实现，从而减少 ASC 评测与部署成本。
+
+## Steering direction protocol update
+
+New steering vectors must be extracted and injected at the same `block_input`
+residual-stream location. A signed-gamma sweep on a held-out calibration split
+then orients the deployed compression vector. The deployed vector is always used
+as a positive additive intervention; evaluation rejects sign/site metadata
+mismatches by default.
+
+See `docs/STEERING_DIRECTION_PROTOCOL.md` for the theory, reference-code
+comparison, causal acceptance rule, and train/test separation requirements.
