@@ -401,25 +401,7 @@ def make_cached_steering_hook(
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
     def add_steer(_, __, output):
-        if torch.is_tensor(output):
-            hidden = output
-            output_kind = "tensor"
-        elif isinstance(output, tuple):
-            hidden = output[0]
-            output_kind = "tuple"
-        elif isinstance(output, list):
-            hidden = output[0]
-            output_kind = "list"
-        else:
-            raise TypeError(
-                "Unsupported transformer-layer output type for steering hook: "
-                f"{type(output)!r}"
-            )
-        if hidden.ndim != 3:
-            raise ValueError(
-                "Expected layer hidden states with shape [batch, seq, hidden], "
-                f"got {tuple(hidden.shape)} from {output_kind} output."
-            )
+        hidden = output[0]
         target = hidden[:, -1, :]
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
@@ -427,11 +409,7 @@ def make_cached_steering_hook(
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
         hidden[:, -1, :] = target + multiplier * gamma * steering_vec
-        if output_kind == "tensor":
-            return hidden
-        if output_kind == "tuple":
-            return (hidden, *output[1:])
-        return [hidden, *output[1:]]
+        return (hidden, *output[1:])
 
     return add_steer
 
