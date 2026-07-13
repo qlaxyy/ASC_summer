@@ -56,13 +56,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer_index", type=str, default="auto")
     parser.add_argument(
         "--vector_method",
-        choices=["asc_endpoint", "actadd_prompt", "actadd_prompt_aligned"],
+        choices=[
+            "asc_endpoint",
+            "actadd_prompt",
+            "actadd_prompt_aligned",
+            "actadd_prompt_paper_aligned",
+        ],
         default="asc_endpoint",
         help=(
             "asc_endpoint compares the ends of complete short/long answers. "
             "actadd_prompt constructs matched concise/step-by-step prompts from "
             "each problem. actadd_prompt_aligned places the style instruction "
-            "before a shared question suffix and pools shared question tokens."
+            "before a shared question suffix and pools shared question tokens. "
+            "actadd_prompt_paper_aligned keeps paper_cot exactly unchanged as "
+            "the long/source prompt and prepends only the concise instruction."
         ),
     )
     parser.add_argument(
@@ -123,7 +130,10 @@ def main() -> None:
     args.dtype = torch_dtype_from_arg(args.dtype)
     if args.pool_last_n_tokens is None:
         args.pool_last_n_tokens = (
-            8 if args.vector_method == "actadd_prompt_aligned" else 1
+            8
+            if args.vector_method
+            in {"actadd_prompt_aligned", "actadd_prompt_paper_aligned"}
+            else 1
         )
     if args.pool_last_n_tokens <= 0:
         raise ValueError("--pool_last_n_tokens must be positive.")
@@ -149,12 +159,14 @@ def main() -> None:
         raise ValueError("--num_samples must be positive or -1.")
     is_actadd = args.vector_method.startswith("actadd_prompt")
     is_aligned = args.vector_method == "actadd_prompt_aligned"
+    is_paper_aligned = args.vector_method == "actadd_prompt_paper_aligned"
+    has_shared_suffix = is_aligned or is_paper_aligned
     if args.vector_method == "asc_endpoint" and args.pairs_path is None:
         raise ValueError("asc_endpoint requires --pairs_path with checked CoT pairs.")
-    if is_aligned and args.problems_path is None:
+    if has_shared_suffix and args.problems_path is None:
         raise ValueError(
-            "actadd_prompt_aligned requires --problems_path so its provenance is "
-            "an explicit unlabeled training split."
+            "Aligned ActAdd prompt methods require --problems_path so their "
+            "provenance is an explicit unlabeled training split."
         )
     if is_actadd:
         if args.direction != "short_minus_long":
@@ -172,7 +184,7 @@ def main() -> None:
     layer_index = utils.resolve_layer_index(model, args.model_name, args.layer_index)
 
     shared_suffix_agreement = None
-    if is_aligned:
+    if has_shared_suffix:
         agreements = []
         for row in pairs:
             short_prompt, long_prompt = utils.pair_prompts_for_activation(
@@ -192,7 +204,7 @@ def main() -> None:
         shared_suffix_agreement = sum(agreements) / len(agreements)
         if shared_suffix_agreement < 1.0:
             raise ValueError(
-                "actadd_prompt_aligned requires identical final pooled token IDs "
+                "Aligned ActAdd prompts require identical final pooled token IDs "
                 f"on every pair; agreement={shared_suffix_agreement:.2%}."
             )
 
@@ -207,13 +219,30 @@ def main() -> None:
     print(f"  pooled tokens:{args.pool_last_n_tokens}")
     if shared_suffix_agreement is not None:
         print(f"  suffix match:{shared_suffix_agreement:.2%}")
-    text_mode = (
-        "aligned style instruction + shared question suffix"
-        if is_aligned
-        else "matched concise prompt vs paper_cot prompt (no generated answers)"
-        if args.vector_method == "actadd_prompt"
-        else "long_prompt + short/long cot"
-    )
+    if is_paper_aligned:
+        text_mode = "concise prefix vs unchanged paper_cot with shared suffix"
+        metadata_text_mode = "concise_prefix_vs_unchanged_paper_cot_shared_suffix"
+        positive_text = "concise_instruction_plus_unchanged_paper_cot"
+        negative_text = "unchanged_paper_cot_prompt"
+        matching_prompt_mode = "paper_cot"
+    elif is_aligned:
+        text_mode = "aligned style instruction + shared question suffix"
+        metadata_text_mode = "aligned_style_instruction_shared_question_suffix"
+        positive_text = "aligned_concise_instruction_plus_question"
+        negative_text = "aligned_detailed_instruction_plus_question"
+        matching_prompt_mode = "actadd_aligned_long"
+    elif args.vector_method == "actadd_prompt":
+        text_mode = "matched concise prompt vs paper_cot prompt (no generated answers)"
+        metadata_text_mode = "short_prompt_vs_long_prompt_last_token"
+        positive_text = "matched_concise_prompt"
+        negative_text = "paper_cot_prompt"
+        matching_prompt_mode = "paper_cot"
+    else:
+        text_mode = "long_prompt + short/long cot"
+        metadata_text_mode = "long_prompt+cot_last_token"
+        positive_text = "long_prompt+short_cot"
+        negative_text = "long_prompt+long_cot"
+        matching_prompt_mode = None
     print(f"  text mode:   {text_mode}")
     print(f"  input device:{input_device}")
     if hasattr(model, "hf_device_map"):
@@ -280,28 +309,10 @@ def main() -> None:
             if is_actadd
             else "h_L[-1] <- h_L[-1] + sign*gamma*mean(v_i)"
         ),
-        "text_mode": (
-            "aligned_style_instruction_shared_question_suffix"
-            if is_aligned
-            else "short_prompt_vs_long_prompt_last_token"
-            if args.vector_method == "actadd_prompt"
-            else "long_prompt+cot_last_token"
-        ),
+        "text_mode": metadata_text_mode,
         "contains_generated_answers": not is_actadd,
-        "positive_text": (
-            "aligned_concise_instruction_plus_question"
-            if is_aligned
-            else "matched_concise_prompt"
-            if args.vector_method == "actadd_prompt"
-            else "long_prompt+short_cot"
-        ),
-        "negative_text": (
-            "aligned_detailed_instruction_plus_question"
-            if is_aligned
-            else "paper_cot_prompt"
-            if args.vector_method == "actadd_prompt"
-            else "long_prompt+long_cot"
-        ),
+        "positive_text": positive_text,
+        "negative_text": negative_text,
         "representation_token": (
             f"mean_last_{args.pool_last_n_tokens}_prompt_tokens"
             if is_actadd
@@ -312,13 +323,8 @@ def main() -> None:
             if is_actadd
             else "last_prompt_token"
         ),
-        "matching_prompt_mode": (
-            "actadd_aligned_long"
-            if is_aligned
-            else "paper_cot"
-            if args.vector_method == "actadd_prompt"
-            else None
-        ),
+        "matching_prompt_mode": matching_prompt_mode,
+        "paper_cot_baseline_unchanged": is_paper_aligned,
         "positive_gamma_only": is_actadd,
         "pool_last_n_tokens": args.pool_last_n_tokens,
         "shared_suffix_token_agreement": shared_suffix_agreement,

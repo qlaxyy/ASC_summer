@@ -245,3 +245,98 @@ Gamma zero in this sweep is the only valid baseline for the aligned method,
 because its prompt is intentionally different from the earlier `paper_cot`
 prompt. Do not compare its token count directly with a baseline generated using
 a different prompt or seed protocol.
+
+### Preliminary aligned-prompt result and baseline confound
+
+The first 100-example run of this method produced:
+
+| gamma | accuracy | average tokens | change from its own baseline |
+|---:|---:|---:|---:|
+| 0.0 | 89% | 1458.6 | baseline |
+| 0.2 | 89% | 1406.8 | -51.8 (-3.55%) |
+
+This is a small positive-direction compression signal with unchanged aggregate
+accuracy, but it is not comparable with the earlier roughly 746-token baseline.
+Two protocol changes affected gamma zero: `actadd_aligned_long` explicitly asks
+the model to work carefully and step by step before presenting the question,
+and the original implementation of `--paired_batch_seeds` reset the seed before
+each batch. The former strongly encourages longer reasoning.
+
+## `actadd_prompt_paper_aligned`: unchanged paper baseline
+
+This follow-up keeps the original evaluator prompt byte-for-byte unchanged:
+
+```text
+P_source(q) = Question: {q}
+              Let's think step by step.
+```
+
+Only the target prompt receives a concise prefix:
+
+```text
+P_target(q) = Reasoning instruction: Be concise and direct. ...
+              Question: {q}
+              Let's think step by step.
+```
+
+Thus both prompts still have identical final eight token IDs, but gamma zero
+uses the original `paper_cot` prompt. Positive addition continues to test the
+unchanged target-minus-source formula. This method is the appropriate one for
+comparison with the earlier paper-prompt experiments.
+
+The paired sampler protocol is also corrected. Gamma zero now follows the
+ordinary continuous seeded RNG trajectory and records the state before each
+batch. Every nonzero gamma replays those recorded states. Pairing therefore no
+longer changes the baseline output merely by resetting its seed per batch.
+
+### Extract from GSM8K train
+
+```bash
+python extract_steering_vector.py \
+  --model_name /root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --problems_path datasets/gsm8k/train.jsonl \
+  --num_samples 200 \
+  --output_vector_path vectors/qwen7b_actadd_paper_aligned_gsm8k_train200_layer20.pt \
+  --vector_method actadd_prompt_paper_aligned \
+  --pool_last_n_tokens 8 \
+  --layer_index 20 \
+  --direction short_minus_long \
+  --activation_site block_input \
+  --max_input_tokens 8192 \
+  --activation_batch_size 8 \
+  --device_map auto \
+  --dtype bfloat16 \
+  --attn_impl sdpa
+```
+
+### Two-point GSM8K test
+
+```bash
+python eval_asc_paper.py \
+  --model_name /root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --dataset gsm8k \
+  --local_data_path datasets/gsm8k/test.jsonl \
+  --limit 100 \
+  --prompt_mode paper_cot \
+  --candidate_gammas 0,0.2 \
+  --steering_vector_path vectors/qwen7b_actadd_paper_aligned_gsm8k_train200_layer20.pt \
+  --layer_index 20 \
+  --injection_sign add \
+  --injection_site block_input \
+  --injection_scope prompt_only \
+  --injection_token_count 8 \
+  --batch_size 8 \
+  --max_new_tokens 4096 \
+  --temperature 0.7 \
+  --top_p 0.9 \
+  --repetition_penalty 1.1 \
+  --seed 42 \
+  --paired_batch_seeds \
+  --attn_impl sdpa \
+  --save_details all \
+  --use_our_eval \
+  --per_gamma_output_dir results/qwen7b_actadd_paper_aligned_gsm8k_test100
+```
+
+The metadata rejects `actadd_aligned_long` for this vector and requires
+`paper_cot`, preventing another accidental baseline change.

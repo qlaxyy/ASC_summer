@@ -64,6 +64,13 @@ ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE = (
     "Question: {problem}"
 )
 
+ACTADD_PAPER_ALIGNED_SHORT_PROMPT_TEMPLATE = (
+    "Reasoning instruction: Be concise and direct. Use minimal mathematical "
+    "reasoning without repeated verification or unnecessary prose.\n"
+    "Question: {problem}\n"
+    "Let's think step by step."
+)
+
 LAYER_HINTS = {
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": 20,
     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": 20,
@@ -663,6 +670,11 @@ def pair_prompts_for_activation(
             ACTADD_ALIGNED_SHORT_PROMPT_TEMPLATE.format(problem=problem),
             ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE.format(problem=problem),
         )
+    if vector_method == "actadd_prompt_paper_aligned":
+        return (
+            ACTADD_PAPER_ALIGNED_SHORT_PROMPT_TEMPLATE.format(problem=problem),
+            ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem),
+        )
     if vector_method != "actadd_prompt":
         raise ValueError(f"Unknown ActAdd vector_method: {vector_method}")
     return (
@@ -675,7 +687,11 @@ def pair_texts_for_activation(
     row: dict[str, Any],
     vector_method: str = "asc_endpoint",
 ) -> tuple[str, str]:
-    if vector_method in {"actadd_prompt", "actadd_prompt_aligned"}:
+    if vector_method in {
+        "actadd_prompt",
+        "actadd_prompt_aligned",
+        "actadd_prompt_paper_aligned",
+    }:
         return pair_prompts_for_activation(row, vector_method)
     if vector_method != "asc_endpoint":
         raise ValueError(f"Unknown vector_method: {vector_method}")

@@ -219,6 +219,9 @@ The repository now keeps two explicitly different vector methods:
   eight positions, and injects the positive vector into those eight prompt
   positions only. Commands and interpretation are in
   `docs/STEERING_DIRECTION_PROTOCOL.md`.
+- `actadd_prompt_paper_aligned` retains the same shared-suffix intervention but
+  restores the evaluator's original `paper_cot` prompt exactly, so gamma zero
+  remains comparable with the established baseline.
 
 `actadd_prompt` metadata rejects negative gamma, sign/site/scope mismatches,
 non-`paper_cot` evaluation prompts, and automatic causal vector flipping. See

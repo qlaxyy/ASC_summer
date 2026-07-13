@@ -96,6 +96,26 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def capture_rng_state() -> dict[str, Any]:
+    """Capture sampler state so a nonzero gamma can replay its baseline batch."""
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 def resolve_model_config(model_name: str) -> tuple[str, dict[str, Any]]:
     if model_name not in MODEL_CONFIGS:
         for key in MODEL_CONFIGS:
@@ -718,6 +738,7 @@ def evaluate_gamma(
     input_device: torch.device,
     steering_vec_cpu: torch.Tensor | None,
     layer_index: int,
+    paired_rng_states: dict[tuple[int, int], dict[str, Any]],
 ) -> dict[str, Any]:
     handle = None
     if abs(gamma) > 1e-12:
@@ -770,7 +791,17 @@ def evaluate_gamma(
             for i in pbar:
                 if args.paired_batch_seeds:
                     batch_index = i // args.batch_size
-                    set_seed(args.seed + run_idx * 100_000 + batch_index)
+                    state_key = (run_idx, batch_index)
+                    if abs(gamma) <= 1e-12:
+                        paired_rng_states[state_key] = capture_rng_state()
+                    else:
+                        baseline_state = paired_rng_states.get(state_key)
+                        if baseline_state is None:
+                            raise RuntimeError(
+                                "Missing gamma=0 RNG state for paired batch "
+                                f"run={run_idx + 1}, batch={batch_index}."
+                            )
+                        restore_rng_state(baseline_state)
                 batch = samples[i : i + args.batch_size]
                 prompts = [
                     build_paper_prompt(
@@ -1035,9 +1066,9 @@ def parse_args() -> argparse.Namespace:
         "--paired_batch_seeds",
         action="store_true",
         help=(
-            "Reset the sampler to the same deterministic seed before each "
-            "corresponding batch at every gamma. This reduces sampling noise "
-            "in paired gamma comparisons without changing prompts or decoding."
+            "Run gamma=0 first, record its natural per-batch RNG states, and "
+            "replay those states for every nonzero gamma. This preserves the "
+            "ordinary baseline sampling trajectory while pairing comparisons."
         ),
     )
     parser.add_argument(
@@ -1163,6 +1194,12 @@ def main() -> None:
         args.layer_index = cfg.get("layer_index")
 
     candidate_gammas = resolve_candidate_gammas(args, cfg)
+    if args.paired_batch_seeds and (
+        not candidate_gammas or abs(candidate_gammas[0]) > 1e-12
+    ):
+        raise ValueError(
+            "--paired_batch_seeds requires gamma=0 to be the first candidate."
+        )
     multi_gamma = len(candidate_gammas) > 1
     needs_steering_vector = any(abs(gamma) > 1e-12 for gamma in candidate_gammas)
     if needs_steering_vector and args.steering_vector_path is None:
@@ -1317,6 +1354,7 @@ def main() -> None:
     low_accuracy_streak = 0
     stopped_early = False
     stop_reason = ""
+    paired_rng_states: dict[tuple[int, int], dict[str, Any]] = {}
 
     try:
         for gamma in candidate_gammas:
@@ -1329,6 +1367,7 @@ def main() -> None:
                 input_device=input_device,
                 steering_vec_cpu=steering_vec_cpu,
                 layer_index=args.layer_index,
+                paired_rng_states=paired_rng_states,
             )
 
             details = row.pop("detailed_results")
