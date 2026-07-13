@@ -41,6 +41,7 @@ import torch.backends.cudnn as cudnn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from asc_steering_utils import ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE
 from asc_steering_utils import ACTADD_LONG_PROMPT_TEMPLATE
 from answer_utils import compare_answers
 from answer_utils import extract_all_answers
@@ -115,6 +116,8 @@ def build_paper_prompt(
         return problem
     if mode == "paper_cot":
         return ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
+    if mode == "actadd_aligned_long":
+        return ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE.format(problem=problem)
     if mode == "paper_boxed_cot":
         return (
             f"Question: {problem}\n"
@@ -396,6 +399,7 @@ def load_and_validate_vector_metadata(
     injection_sign: str,
     injection_site: str,
     injection_scope: str,
+    injection_token_count: int,
     prompt_mode: str,
     allow_mismatch: bool,
 ) -> dict[str, Any] | None:
@@ -409,6 +413,7 @@ def load_and_validate_vector_metadata(
     )
     expected_scope = metadata.get("recommended_injection_scope")
     expected_prompt_mode = metadata.get("matching_prompt_mode")
+    expected_token_count = metadata.get("recommended_injection_token_count")
     mismatches = []
     if expected_sign and expected_sign != injection_sign:
         mismatches.append(
@@ -425,6 +430,11 @@ def load_and_validate_vector_metadata(
     if expected_prompt_mode and expected_prompt_mode != prompt_mode:
         mismatches.append(
             f"prompt_mode={prompt_mode!r}, metadata expects {expected_prompt_mode!r}"
+        )
+    if expected_token_count and int(expected_token_count) != injection_token_count:
+        mismatches.append(
+            f"injection_token_count={injection_token_count!r}, metadata expects "
+            f"{int(expected_token_count)!r}"
         )
     if mismatches and not allow_mismatch:
         raise ValueError(
@@ -480,6 +490,7 @@ def save_causally_oriented_vector(
         "recommended_positive_gamma": abs(float(selected["gamma"])),
         "recommended_injection_sign": "add",
         "recommended_injection_scope": args.injection_scope,
+        "recommended_injection_token_count": args.injection_token_count,
         "activation_site": args.injection_site,
         "matching_injection_site": args.injection_site,
         "calibration_dataset": args.dataset,
@@ -502,6 +513,7 @@ def make_cached_output_steering_hook(
     gamma: float,
     injection_sign: str,
     injection_scope: str,
+    injection_token_count: int,
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
@@ -514,13 +526,15 @@ def make_cached_output_steering_hook(
             return None
         if injection_scope != "prompt_only" and injection_scope != "all_tokens":
             raise ValueError(f"Unsupported injection_scope: {injection_scope}")
-        target = hidden[:, -1, :]
+        target = hidden[:, -injection_token_count:, :]
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        hidden[:, -1, :] = target + multiplier * gamma * steering_vec
+        hidden[:, -injection_token_count:, :] = (
+            target + multiplier * gamma * steering_vec
+        )
         return (hidden, *output[1:])
 
     return add_steer
@@ -531,6 +545,7 @@ def make_cached_input_steering_hook(
     gamma: float,
     injection_sign: str,
     injection_scope: str,
+    injection_token_count: int,
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
@@ -543,13 +558,15 @@ def make_cached_input_steering_hook(
             return None
         if injection_scope != "prompt_only" and injection_scope != "all_tokens":
             raise ValueError(f"Unsupported injection_scope: {injection_scope}")
-        target = hidden[:, -1, :]
+        target = hidden[:, -injection_token_count:, :]
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        hidden[:, -1, :] = target + multiplier * gamma * steering_vec
+        hidden[:, -injection_token_count:, :] = (
+            target + multiplier * gamma * steering_vec
+        )
         return (hidden, *inputs[1:])
 
     return add_steer
@@ -714,6 +731,7 @@ def evaluate_gamma(
                     gamma,
                     args.injection_sign,
                     args.injection_scope,
+                    args.injection_token_count,
                 )
             )
         elif args.injection_site == "block_output":
@@ -723,6 +741,7 @@ def evaluate_gamma(
                     gamma,
                     args.injection_sign,
                     args.injection_scope,
+                    args.injection_token_count,
                 )
             )
         else:
@@ -749,6 +768,9 @@ def evaluate_gamma(
             pbar = tqdm(range(0, total, args.batch_size), desc=desc)
 
             for i in pbar:
+                if args.paired_batch_seeds:
+                    batch_index = i // args.batch_size
+                    set_seed(args.seed + run_idx * 100_000 + batch_index)
                 batch = samples[i : i + args.batch_size]
                 prompts = [
                     build_paper_prompt(
@@ -813,7 +835,7 @@ def evaluate_gamma(
                     if args.save_details != "none":
                         details.append(
                             {
-                                "question": prompt[:200],
+                                "question": prompt,
                                 "model_output": gen,
                                 "pred_answer": pred,
                                 "gt_answer": gt,
@@ -945,6 +967,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--injection_token_count",
+        type=int,
+        default=1,
+        help=(
+            "Number of final prompt positions receiving the vector. It must "
+            "match vector metadata; legacy and actadd_prompt v1 vectors use 1."
+        ),
+    )
+    parser.add_argument(
         "--allow_vector_metadata_mismatch",
         action="store_true",
         help="Allow a deliberate sign/site mismatch with vector sidecar metadata.",
@@ -979,6 +1010,7 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "raw",
             "paper_cot",
+            "actadd_aligned_long",
             "paper_boxed_cot",
             "chat_paper_cot",
             "chat_boxed_cot",
@@ -999,6 +1031,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num_runs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--paired_batch_seeds",
+        action="store_true",
+        help=(
+            "Reset the sampler to the same deterministic seed before each "
+            "corresponding batch at every gamma. This reduces sampling noise "
+            "in paired gamma comparisons without changing prompts or decoding."
+        ),
+    )
     parser.add_argument(
         "--qwen3_enable_thinking",
         dest="qwen3_enable_thinking",
@@ -1108,6 +1149,8 @@ def main() -> None:
         raise ValueError("--num_runs must be positive.")
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
+    if args.injection_token_count <= 0:
+        raise ValueError("--injection_token_count must be positive.")
 
     set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
@@ -1154,12 +1197,13 @@ def main() -> None:
             args.injection_sign,
             args.injection_site,
             args.injection_scope,
+            args.injection_token_count,
             args.prompt_mode,
             args.allow_vector_metadata_mismatch,
         )
         if (
             vector_metadata is not None
-            and vector_metadata.get("vector_method") == "actadd_prompt"
+            and vector_metadata.get("positive_gamma_only")
         ):
             protocol_errors = []
             if any(gamma < -1e-12 for gamma in candidate_gammas):
@@ -1206,6 +1250,7 @@ def main() -> None:
         print(f"  injection sign: {args.injection_sign}")
         print(f"  injection site: {args.injection_site}")
         print(f"  injection scope:{args.injection_scope}")
+        print(f"  injection tokens:{args.injection_token_count}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)
@@ -1259,7 +1304,8 @@ def main() -> None:
                 f"direction={vector_metadata.get('direction') or vector_metadata.get('vector_type')}, "
                 f"method={vector_metadata.get('vector_method')}, "
                 f"site={vector_metadata.get('activation_site')}, "
-                f"scope={vector_metadata.get('recommended_injection_scope')}"
+                f"scope={vector_metadata.get('recommended_injection_scope')}, "
+                f"tokens={vector_metadata.get('recommended_injection_token_count')}"
             )
     else:
         print("[4/4] Running gammas")

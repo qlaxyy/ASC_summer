@@ -214,6 +214,11 @@ The repository now keeps two explicitly different vector methods:
 - `actadd_prompt` compares matched concise and step-by-step prompts before any
   answer is generated, then applies the unchanged `short - long` vector by
   positive addition at `block_input` on the initial prompt pass only.
+- `actadd_prompt_aligned` is the follow-up experiment: it contrasts identical
+  question-suffix tokens under concise/detailed instructions, pools the final
+  eight positions, and injects the positive vector into those eight prompt
+  positions only. Commands and interpretation are in
+  `docs/STEERING_DIRECTION_PROTOCOL.md`.
 
 `actadd_prompt` metadata rejects negative gamma, sign/site/scope mismatches,
 non-`paper_cot` evaluation prompts, and automatic causal vector flipping. See

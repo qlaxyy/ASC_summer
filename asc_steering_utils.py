@@ -53,6 +53,17 @@ ACTADD_LONG_PROMPT_TEMPLATE = (
     "Let's think step by step."
 )
 
+ACTADD_ALIGNED_SHORT_PROMPT_TEMPLATE = (
+    "Reasoning instruction: Be concise and direct. Use minimal mathematical "
+    "reasoning without repeated verification or unnecessary prose.\n"
+    "Question: {problem}"
+)
+
+ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE = (
+    "Reasoning instruction: Work through the solution carefully and step by step.\n"
+    "Question: {problem}"
+)
+
 LAYER_HINTS = {
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": 20,
     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": 20,
@@ -641,9 +652,19 @@ def append_cot_to_prompt(prompt: str, cot: str) -> str:
     return prompt + "\n" + cot
 
 
-def pair_prompts_for_activation(row: dict[str, Any]) -> tuple[str, str]:
+def pair_prompts_for_activation(
+    row: dict[str, Any],
+    vector_method: str = "actadd_prompt",
+) -> tuple[str, str]:
     """Return target/source prompts for prompt-contrast activation addition."""
     problem = problem_from_row(row)
+    if vector_method == "actadd_prompt_aligned":
+        return (
+            ACTADD_ALIGNED_SHORT_PROMPT_TEMPLATE.format(problem=problem),
+            ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE.format(problem=problem),
+        )
+    if vector_method != "actadd_prompt":
+        raise ValueError(f"Unknown ActAdd vector_method: {vector_method}")
     return (
         ACTADD_SHORT_PROMPT_TEMPLATE.format(problem=problem),
         ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem),
@@ -654,8 +675,8 @@ def pair_texts_for_activation(
     row: dict[str, Any],
     vector_method: str = "asc_endpoint",
 ) -> tuple[str, str]:
-    if vector_method == "actadd_prompt":
-        return pair_prompts_for_activation(row)
+    if vector_method in {"actadd_prompt", "actadd_prompt_aligned"}:
+        return pair_prompts_for_activation(row, vector_method)
     if vector_method != "asc_endpoint":
         raise ValueError(f"Unknown vector_method: {vector_method}")
 
@@ -700,6 +721,7 @@ def last_token_activations(
     max_input_tokens: int,
     batch_size: int,
     activation_site: str,
+    pool_last_n_tokens: int = 1,
 ) -> torch.Tensor:
     activations: list[torch.Tensor] = []
     old_truncation_side = tokenizer.truncation_side
@@ -709,6 +731,8 @@ def last_token_activations(
         raise IndexError(
             f"layer_index={layer_index} is out of range for {len(layers)} layers"
         )
+    if pool_last_n_tokens <= 0:
+        raise ValueError("pool_last_n_tokens must be positive")
 
     tokenizer.truncation_side = "left"
     tokenizer.padding_side = "left"
@@ -719,7 +743,11 @@ def last_token_activations(
             if activation_site == "block_input":
                 def capture_hook(_module: Any, hook_inputs: Any) -> None:
                     captured.append(
-                        first_tensor(hook_inputs)[:, -1].detach().float().cpu()
+                        first_tensor(hook_inputs)[:, -pool_last_n_tokens:, :]
+                        .mean(dim=1)
+                        .detach()
+                        .float()
+                        .cpu()
                     )
 
                 handle = layers[layer_index].register_forward_pre_hook(capture_hook)
@@ -730,7 +758,11 @@ def last_token_activations(
                     output: Any,
                 ) -> None:
                     captured.append(
-                        first_tensor(output)[:, -1].detach().float().cpu()
+                        first_tensor(output)[:, -pool_last_n_tokens:, :]
+                        .mean(dim=1)
+                        .detach()
+                        .float()
+                        .cpu()
                     )
 
                 handle = layers[layer_index].register_forward_hook(capture_hook)
@@ -777,6 +809,7 @@ def extract_vectors(
     direction: str,
     activation_site: str,
     vector_method: str = "asc_endpoint",
+    pool_last_n_tokens: int = 1,
 ) -> torch.Tensor:
     short_texts: list[str] = []
     long_texts: list[str] = []
@@ -794,6 +827,7 @@ def extract_vectors(
         max_input_tokens,
         activation_batch_size,
         activation_site,
+        pool_last_n_tokens,
     )
     long_acts = last_token_activations(
         model,
@@ -804,6 +838,7 @@ def extract_vectors(
         max_input_tokens,
         activation_batch_size,
         activation_site,
+        pool_last_n_tokens,
     )
     if direction == "short_minus_long":
         return short_acts - long_acts

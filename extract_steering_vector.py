@@ -1,15 +1,13 @@
-"""
-Extract ASC endpoint or ActAdd prompt-contrast vectors from a checked pair file.
+"""Extract ASC endpoint or ActAdd prompt-contrast steering vectors.
 
-This script only does the second half of the pipeline:
-  1. Read a manually filtered pairs JSON file.
-  2. Build either answer-endpoint texts or short/long contrast prompts.
-  3. Extract matched target-layer activations and save their differences.
+Endpoint extraction reads manually filtered answer pairs. Prompt-contrast
+extraction can instead read unlabeled problem rows and never generates answers.
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -40,21 +38,52 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="/root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     )
-    parser.add_argument("--pairs_path", type=str, required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
+        "--pairs_path",
+        type=str,
+        help="Checked JSON pair list used by asc_endpoint or actadd_prompt.",
+    )
+    inputs.add_argument(
+        "--problems_path",
+        type=str,
+        help=(
+            "JSONL/JSON problem rows. actadd_prompt_aligned should use an "
+            "unlabeled training split such as datasets/gsm8k/train.jsonl."
+        ),
+    )
     parser.add_argument("--output_vector_path", type=str, required=True)
     parser.add_argument("--layer_index", type=str, default="auto")
     parser.add_argument(
         "--vector_method",
-        choices=["asc_endpoint", "actadd_prompt"],
+        choices=["asc_endpoint", "actadd_prompt", "actadd_prompt_aligned"],
         default="asc_endpoint",
         help=(
             "asc_endpoint compares the ends of complete short/long answers. "
             "actadd_prompt constructs matched concise/step-by-step prompts from "
-            "each problem and compares them before any answer is generated."
+            "each problem. actadd_prompt_aligned places the style instruction "
+            "before a shared question suffix and pools shared question tokens."
+        ),
+    )
+    parser.add_argument(
+        "--pool_last_n_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Average the final N activation positions per contrast prompt. "
+            "Defaults to 8 for actadd_prompt_aligned and 1 otherwise."
         ),
     )
     parser.add_argument("--max_input_tokens", type=int, default=8192)
     parser.add_argument("--activation_batch_size", type=int, default=4)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=-1,
+        help=(
+            "Randomly select this many input rows with --seed. -1 uses all rows."
+        ),
+    )
     parser.add_argument(
         "--direction",
         choices=["short_minus_long", "long_minus_short"],
@@ -92,39 +121,96 @@ def main() -> None:
     args = parse_args()
     utils.set_seed(args.seed)
     args.dtype = torch_dtype_from_arg(args.dtype)
+    if args.pool_last_n_tokens is None:
+        args.pool_last_n_tokens = (
+            8 if args.vector_method == "actadd_prompt_aligned" else 1
+        )
+    if args.pool_last_n_tokens <= 0:
+        raise ValueError("--pool_last_n_tokens must be positive.")
 
-    pairs_path = Path(args.pairs_path)
-    if not pairs_path.exists():
-        raise FileNotFoundError(f"Pairs file not found: {pairs_path}")
+    source_path = Path(args.pairs_path or args.problems_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Input file not found: {source_path}")
 
-    pairs = utils.read_json(pairs_path)
+    pairs = (
+        utils.read_jsonl(source_path)
+        if source_path.suffix.lower() == ".jsonl"
+        else utils.read_json(source_path)
+    )
     if not isinstance(pairs, list) or not pairs:
-        raise ValueError("--pairs_path must contain a non-empty JSON list.")
-    if args.vector_method == "actadd_prompt":
+        raise ValueError("The input path must contain non-empty problem rows.")
+    source_row_count = len(pairs)
+    selected_indices = list(range(source_row_count))
+    if 0 < args.num_samples < source_row_count:
+        rng = random.Random(args.seed)
+        selected_indices = rng.sample(selected_indices, args.num_samples)
+        pairs = [pairs[index] for index in selected_indices]
+    elif args.num_samples == 0:
+        raise ValueError("--num_samples must be positive or -1.")
+    is_actadd = args.vector_method.startswith("actadd_prompt")
+    is_aligned = args.vector_method == "actadd_prompt_aligned"
+    if args.vector_method == "asc_endpoint" and args.pairs_path is None:
+        raise ValueError("asc_endpoint requires --pairs_path with checked CoT pairs.")
+    if is_aligned and args.problems_path is None:
+        raise ValueError(
+            "actadd_prompt_aligned requires --problems_path so its provenance is "
+            "an explicit unlabeled training split."
+        )
+    if is_actadd:
         if args.direction != "short_minus_long":
             raise ValueError(
-                "actadd_prompt tests the target-minus-source theory and therefore "
-                "requires --direction short_minus_long."
+                "ActAdd prompt methods test target-minus-source and therefore "
+                "require --direction short_minus_long."
             )
         if args.activation_site != "block_input":
             raise ValueError(
-                "actadd_prompt requires --activation_site block_input to match "
+                "ActAdd prompt methods require --activation_site block_input to match "
                 "the ActAdd residual-stream intervention site."
             )
 
     model, tokenizer, input_device = utils.load_model_and_tokenizer(args)
     layer_index = utils.resolve_layer_index(model, args.model_name, args.layer_index)
 
+    shared_suffix_agreement = None
+    if is_aligned:
+        agreements = []
+        for row in pairs:
+            short_prompt, long_prompt = utils.pair_prompts_for_activation(
+                row, args.vector_method
+            )
+            short_ids = tokenizer(short_prompt)["input_ids"]
+            long_ids = tokenizer(long_prompt)["input_ids"]
+            if min(len(short_ids), len(long_ids)) < args.pool_last_n_tokens:
+                raise ValueError(
+                    "A contrast prompt is shorter than --pool_last_n_tokens="
+                    f"{args.pool_last_n_tokens}."
+                )
+            agreements.append(
+                short_ids[-args.pool_last_n_tokens :]
+                == long_ids[-args.pool_last_n_tokens :]
+            )
+        shared_suffix_agreement = sum(agreements) / len(agreements)
+        if shared_suffix_agreement < 1.0:
+            raise ValueError(
+                "actadd_prompt_aligned requires identical final pooled token IDs "
+                f"on every pair; agreement={shared_suffix_agreement:.2%}."
+            )
+
     print("Extracting steering vectors")
     print(f"  model:       {args.model_name}")
-    print(f"  pairs:       {pairs_path}")
+    print(f"  input:       {source_path}")
     print(f"  samples:     {len(pairs)}")
     print(f"  layer:       {layer_index}")
     print(f"  method:      {args.vector_method}")
     print(f"  direction:   {args.direction}")
     print(f"  site:        {args.activation_site}")
+    print(f"  pooled tokens:{args.pool_last_n_tokens}")
+    if shared_suffix_agreement is not None:
+        print(f"  suffix match:{shared_suffix_agreement:.2%}")
     text_mode = (
-        "matched concise prompt vs paper_cot prompt (no generated answers)"
+        "aligned style instruction + shared question suffix"
+        if is_aligned
+        else "matched concise prompt vs paper_cot prompt (no generated answers)"
         if args.vector_method == "actadd_prompt"
         else "long_prompt + short/long cot"
     )
@@ -144,6 +230,7 @@ def main() -> None:
         direction=args.direction,
         activation_site=args.activation_site,
         vector_method=args.vector_method,
+        pool_last_n_tokens=args.pool_last_n_tokens,
     )
 
     output_vector = Path(args.output_vector_path)
@@ -156,8 +243,8 @@ def main() -> None:
     pair_projection_margins = vectors @ (mean_vector / mean_vector_norm)
     first_pair = pairs[0]
     actadd_short_example, actadd_long_example = (
-        utils.pair_prompts_for_activation(first_pair)
-        if args.vector_method == "actadd_prompt"
+        utils.pair_prompts_for_activation(first_pair, args.vector_method)
+        if is_actadd
         else (None, None)
     )
     metadata = {
@@ -172,7 +259,10 @@ def main() -> None:
             "add" if args.direction == "short_minus_long" else "subtract"
         ),
         "recommended_injection_scope": (
-            "prompt_only" if args.vector_method == "actadd_prompt" else "all_tokens"
+            "prompt_only" if is_actadd else "all_tokens"
+        ),
+        "recommended_injection_token_count": (
+            args.pool_last_n_tokens if is_actadd else 1
         ),
         "formula": (
             "v = h(short) - h(long); h <- h + gamma*v"
@@ -180,41 +270,58 @@ def main() -> None:
             else "v = h(long) - h(short); h <- h - gamma*v"
         ),
         "extraction_formula": (
-            "v_i = h_pre_L(P_short(q_i))[-1] - h_pre_L(P_long(q_i))[-1]"
-            if args.vector_method == "actadd_prompt"
+            "v_i = mean_last_N(h_pre_L(P_short(q_i))) - "
+            "mean_last_N(h_pre_L(P_long(q_i)))"
+            if is_actadd
             else "v_i = h_L(long_prompt+short_cot)[-1] - h_L(long_prompt+long_cot)[-1]"
         ),
         "injection_formula": (
-            "h_pre_L(P_long(q))[-1] <- h_pre_L(P_long(q))[-1] + gamma*mean(v_i)"
-            if args.vector_method == "actadd_prompt"
+            "h_pre_L(P_long(q))[-N:] <- h_pre_L(P_long(q))[-N:] + gamma*mean(v_i)"
+            if is_actadd
             else "h_L[-1] <- h_L[-1] + sign*gamma*mean(v_i)"
         ),
         "text_mode": (
-            "short_prompt_vs_long_prompt_last_token"
+            "aligned_style_instruction_shared_question_suffix"
+            if is_aligned
+            else "short_prompt_vs_long_prompt_last_token"
             if args.vector_method == "actadd_prompt"
             else "long_prompt+cot_last_token"
         ),
-        "contains_generated_answers": args.vector_method == "asc_endpoint",
+        "contains_generated_answers": not is_actadd,
         "positive_text": (
-            "matched_concise_prompt"
+            "aligned_concise_instruction_plus_question"
+            if is_aligned
+            else "matched_concise_prompt"
             if args.vector_method == "actadd_prompt"
             else "long_prompt+short_cot"
         ),
         "negative_text": (
-            "paper_cot_prompt"
+            "aligned_detailed_instruction_plus_question"
+            if is_aligned
+            else "paper_cot_prompt"
             if args.vector_method == "actadd_prompt"
             else "long_prompt+long_cot"
         ),
         "representation_token": (
-            "last_prompt_token"
-            if args.vector_method == "actadd_prompt"
+            f"mean_last_{args.pool_last_n_tokens}_prompt_tokens"
+            if is_actadd
             else "last_answer_token"
         ),
-        "intervention_token": "last_prompt_token",
-        "matching_prompt_mode": (
-            "paper_cot" if args.vector_method == "actadd_prompt" else None
+        "intervention_token": (
+            f"last_{args.pool_last_n_tokens}_prompt_tokens"
+            if is_actadd
+            else "last_prompt_token"
         ),
-        "positive_gamma_only": args.vector_method == "actadd_prompt",
+        "matching_prompt_mode": (
+            "actadd_aligned_long"
+            if is_aligned
+            else "paper_cot"
+            if args.vector_method == "actadd_prompt"
+            else None
+        ),
+        "positive_gamma_only": is_actadd,
+        "pool_last_n_tokens": args.pool_last_n_tokens,
+        "shared_suffix_token_agreement": shared_suffix_agreement,
         "num_vectors": int(vectors.shape[0]),
         "hidden_size": int(vectors.shape[1]),
         "vector_norm_mean": float(norms.mean().item()),
@@ -228,23 +335,29 @@ def main() -> None:
         "mean_pair_projection_margin": float(
             pair_projection_margins.mean().item()
         ),
-        "pairs_path": str(pairs_path),
+        "source_path": str(source_path),
+        "source_row_count": source_row_count,
+        "selected_row_indices": selected_indices,
+        "sample_selection": (
+            "seeded_random_without_replacement"
+            if len(pairs) < source_row_count
+            else "all_rows"
+        ),
+        "sample_seed": args.seed,
+        "pairs_path": str(source_path) if args.pairs_path else None,
+        "problems_path": str(source_path) if args.problems_path else None,
         "long_source": (
             "constructed_from_problem"
-            if args.vector_method == "actadd_prompt"
+            if is_actadd
             else str(first_pair.get("long_source") or "unknown")
         ),
         "short_source": (
             "constructed_from_problem"
-            if args.vector_method == "actadd_prompt"
+            if is_actadd
             else str(first_pair.get("short_source") or "unknown")
         ),
-        "short_prompt_example": (
-            actadd_short_example if args.vector_method == "actadd_prompt" else None
-        ),
-        "long_prompt_example": (
-            actadd_long_example if args.vector_method == "actadd_prompt" else None
-        ),
+        "short_prompt_example": actadd_short_example if is_actadd else None,
+        "long_prompt_example": actadd_long_example if is_actadd else None,
         "activation_batch_size": args.activation_batch_size,
         "output_vector_path": str(output_vector),
         "created_at_unix": time.time(),
