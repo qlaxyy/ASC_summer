@@ -102,14 +102,15 @@ Please reason step by step, and put your final answer within \boxed{}.
 数学字符，没有 replacement character、CJK 异常字符或控制字符。Windows 终端曾显示的
 `鈧/螖/虏` 是控制台解码错误，不应据此删除样本。重复推理暂不作为自动剔除条件。
 
-## 2026-07 direction protocol update
+## 2026-07 prompt-contrast protocol update
 
-New vectors no longer use a block-output hook by default. Extraction and
-injection now both use `block_input`, matching the pre-residual implementation
-in ActAdd and CAST. Legacy block-output experiments remain available only via an
-explicit site option.
+`asc_endpoint` still represents the original complete-answer endpoint method.
+Its negative causal sign is recorded as a paper/code discrepancy and is not
+hidden by renaming a flipped vector.
 
-Representational orientation and causal compression orientation are recorded
-separately. See `docs/STEERING_DIRECTION_PROTOCOL.md` for the held-out sign
-calibration rule and the requirement that deployed compression vectors always
-use positive additive injection.
+`actadd_prompt` constructs a matched concise prompt and the exact `paper_cot`
+step-by-step prompt from each problem. It reads the last prompt-token
+`block_input` state before generation, computes concise minus step-by-step, and
+adds the unchanged vector only during the initial prompt forward pass. Metadata
+enforces positive gamma, additive injection, `block_input`, `prompt_only`, and
+`paper_cot` unless a diagnostic mismatch override is explicitly requested.

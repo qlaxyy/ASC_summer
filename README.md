@@ -207,11 +207,14 @@ extract_paper_kl_gamma.py
 
 ## Steering direction protocol update
 
-New steering vectors must be extracted and injected at the same `block_input`
-residual-stream location. A signed-gamma sweep on a held-out calibration split
-then orients the deployed compression vector. The deployed vector is always used
-as a positive additive intervention; evaluation rejects sign/site metadata
-mismatches by default.
+The repository now keeps two explicitly different vector methods:
 
-See `docs/STEERING_DIRECTION_PROTOCOL.md` for the theory, reference-code
-comparison, causal acceptance rule, and train/test separation requirements.
+- `asc_endpoint` reproduces the complete-answer endpoint contrast and preserves
+  the observed paper/code sign discrepancy;
+- `actadd_prompt` compares matched concise and step-by-step prompts before any
+  answer is generated, then applies the unchanged `short - long` vector by
+  positive addition at `block_input` on the initial prompt pass only.
+
+`actadd_prompt` metadata rejects negative gamma, sign/site/scope mismatches,
+non-`paper_cot` evaluation prompts, and automatic causal vector flipping. See
+`docs/STEERING_DIRECTION_PROTOCOL.md` for commands and interpretation.

@@ -42,6 +42,17 @@ DEEPSEEK_SHORT_TEMPLATE = (
     "and symbolic as possible. Use minimal English.\n\nProblem:\n{problem}"
 )
 
+ACTADD_SHORT_PROMPT_TEMPLATE = (
+    "Question: {problem}\n"
+    "Let's solve this briefly and directly, using concise mathematical reasoning "
+    "without repeated verification or unnecessary prose."
+)
+
+ACTADD_LONG_PROMPT_TEMPLATE = (
+    "Question: {problem}\n"
+    "Let's think step by step."
+)
+
 LAYER_HINTS = {
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": 20,
     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": 20,
@@ -630,7 +641,24 @@ def append_cot_to_prompt(prompt: str, cot: str) -> str:
     return prompt + "\n" + cot
 
 
-def pair_texts_for_activation(row: dict[str, Any]) -> tuple[str, str]:
+def pair_prompts_for_activation(row: dict[str, Any]) -> tuple[str, str]:
+    """Return target/source prompts for prompt-contrast activation addition."""
+    problem = problem_from_row(row)
+    return (
+        ACTADD_SHORT_PROMPT_TEMPLATE.format(problem=problem),
+        ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem),
+    )
+
+
+def pair_texts_for_activation(
+    row: dict[str, Any],
+    vector_method: str = "asc_endpoint",
+) -> tuple[str, str]:
+    if vector_method == "actadd_prompt":
+        return pair_prompts_for_activation(row)
+    if vector_method != "asc_endpoint":
+        raise ValueError(f"Unknown vector_method: {vector_method}")
+
     _problem, short_cot, long_cot = normalize_pair(row)
     long_prompt = row.get("long_prompt")
     if not long_prompt:
@@ -748,11 +776,12 @@ def extract_vectors(
     activation_batch_size: int,
     direction: str,
     activation_site: str,
+    vector_method: str = "asc_endpoint",
 ) -> torch.Tensor:
     short_texts: list[str] = []
     long_texts: list[str] = []
     for row in pairs:
-        short_text, long_text = pair_texts_for_activation(row)
+        short_text, long_text = pair_texts_for_activation(row, vector_method)
         short_texts.append(short_text)
         long_texts.append(long_text)
 

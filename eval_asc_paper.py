@@ -41,6 +41,7 @@ import torch.backends.cudnn as cudnn
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from asc_steering_utils import ACTADD_LONG_PROMPT_TEMPLATE
 from answer_utils import compare_answers
 from answer_utils import extract_all_answers
 from answer_utils import extract_answer
@@ -113,7 +114,7 @@ def build_paper_prompt(
     if mode == "raw":
         return problem
     if mode == "paper_cot":
-        return f"Question: {problem}\nLet's think step by step."
+        return ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
     if mode == "paper_boxed_cot":
         return (
             f"Question: {problem}\n"
@@ -394,6 +395,8 @@ def load_and_validate_vector_metadata(
     vector_path: str,
     injection_sign: str,
     injection_site: str,
+    injection_scope: str,
+    prompt_mode: str,
     allow_mismatch: bool,
 ) -> dict[str, Any] | None:
     metadata_path = Path(vector_path + ".metadata.json")
@@ -404,6 +407,8 @@ def load_and_validate_vector_metadata(
     expected_site = metadata.get("matching_injection_site") or metadata.get(
         "activation_site"
     )
+    expected_scope = metadata.get("recommended_injection_scope")
+    expected_prompt_mode = metadata.get("matching_prompt_mode")
     mismatches = []
     if expected_sign and expected_sign != injection_sign:
         mismatches.append(
@@ -412,6 +417,14 @@ def load_and_validate_vector_metadata(
     if expected_site and expected_site != injection_site:
         mismatches.append(
             f"injection_site={injection_site!r}, metadata expects {expected_site!r}"
+        )
+    if expected_scope and expected_scope != injection_scope:
+        mismatches.append(
+            f"injection_scope={injection_scope!r}, metadata expects {expected_scope!r}"
+        )
+    if expected_prompt_mode and expected_prompt_mode != prompt_mode:
+        mismatches.append(
+            f"prompt_mode={prompt_mode!r}, metadata expects {expected_prompt_mode!r}"
         )
     if mismatches and not allow_mismatch:
         raise ValueError(
@@ -466,6 +479,7 @@ def save_causally_oriented_vector(
         "selected_signed_gamma": float(selected["gamma"]),
         "recommended_positive_gamma": abs(float(selected["gamma"])),
         "recommended_injection_sign": "add",
+        "recommended_injection_scope": args.injection_scope,
         "activation_site": args.injection_site,
         "matching_injection_site": args.injection_site,
         "calibration_dataset": args.dataset,
@@ -487,6 +501,7 @@ def make_cached_output_steering_hook(
     steering_vec_cpu: torch.Tensor,
     gamma: float,
     injection_sign: str,
+    injection_scope: str,
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
@@ -495,6 +510,10 @@ def make_cached_output_steering_hook(
 
     def add_steer(_, __, output):
         hidden = output[0]
+        if injection_scope == "prompt_only" and hidden.shape[1] <= 1:
+            return None
+        if injection_scope != "prompt_only" and injection_scope != "all_tokens":
+            raise ValueError(f"Unsupported injection_scope: {injection_scope}")
         target = hidden[:, -1, :]
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
@@ -511,6 +530,7 @@ def make_cached_input_steering_hook(
     steering_vec_cpu: torch.Tensor,
     gamma: float,
     injection_sign: str,
+    injection_scope: str,
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
@@ -519,6 +539,10 @@ def make_cached_input_steering_hook(
 
     def add_steer(_module, inputs):
         hidden = inputs[0]
+        if injection_scope == "prompt_only" and hidden.shape[1] <= 1:
+            return None
+        if injection_scope != "prompt_only" and injection_scope != "all_tokens":
+            raise ValueError(f"Unsupported injection_scope: {injection_scope}")
         target = hidden[:, -1, :]
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
@@ -689,6 +713,7 @@ def evaluate_gamma(
                     steering_vec_cpu,
                     gamma,
                     args.injection_sign,
+                    args.injection_scope,
                 )
             )
         elif args.injection_site == "block_output":
@@ -697,6 +722,7 @@ def evaluate_gamma(
                     steering_vec_cpu,
                     gamma,
                     args.injection_sign,
+                    args.injection_scope,
                 )
             )
         else:
@@ -909,6 +935,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--injection_scope",
+        choices=["all_tokens", "prompt_only"],
+        default="all_tokens",
+        help=(
+            "all_tokens steers the prompt and every cached generation step as "
+            "in legacy ASC. prompt_only steers only the last prompt token on "
+            "the initial forward pass, as required by actadd_prompt vectors."
+        ),
+    )
+    parser.add_argument(
         "--allow_vector_metadata_mismatch",
         action="store_true",
         help="Allow a deliberate sign/site mismatch with vector sidecar metadata.",
@@ -1110,6 +1146,39 @@ def main() -> None:
         )
     if args.orientation_accuracy_tolerance < 0:
         raise ValueError("--orientation_accuracy_tolerance must be nonnegative.")
+
+    vector_metadata = None
+    if needs_steering_vector:
+        vector_metadata = load_and_validate_vector_metadata(
+            args.steering_vector_path,
+            args.injection_sign,
+            args.injection_site,
+            args.injection_scope,
+            args.prompt_mode,
+            args.allow_vector_metadata_mismatch,
+        )
+        if (
+            vector_metadata is not None
+            and vector_metadata.get("vector_method") == "actadd_prompt"
+        ):
+            protocol_errors = []
+            if any(gamma < -1e-12 for gamma in candidate_gammas):
+                protocol_errors.append(
+                    "actadd_prompt is a target-minus-source theory test and accepts "
+                    "only gamma >= 0"
+                )
+            if args.orient_vector_output_path is not None:
+                protocol_errors.append(
+                    "actadd_prompt cannot be passed to --orient_vector_output_path; "
+                    "the raw short-minus-long direction must remain unchanged"
+                )
+            if protocol_errors and not args.allow_vector_metadata_mismatch:
+                raise ValueError(
+                    "ActAdd prompt-vector protocol violation: "
+                    + "; ".join(protocol_errors)
+                    + ". Pass --allow_vector_metadata_mismatch only for an explicitly "
+                    "labeled diagnostic experiment."
+                )
     model_alias = args.file_model_alias or model_alias_from_name(args.model_name)
 
     args.resolved_device_map = resolve_device_map(args)
@@ -1136,6 +1205,7 @@ def main() -> None:
         print(f"  layer:          {args.layer_index}")
         print(f"  injection sign: {args.injection_sign}")
         print(f"  injection site: {args.injection_site}")
+        print(f"  injection scope:{args.injection_scope}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)
@@ -1155,7 +1225,7 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    print(f"[2/4] Loading model")
+    print("[2/4] Loading model")
     model_kwargs: dict[str, Any] = {
         "torch_dtype": torch_dtype_from_arg(args.dtype),
         "attn_implementation": args.attn_impl,
@@ -1179,22 +1249,17 @@ def main() -> None:
     print(f"  samples:        {len(samples)}")
 
     steering_vec_cpu = None
-    vector_metadata = None
     if needs_steering_vector:
         print("[4/4] Loading steering vector and running gammas")
-        vector_metadata = load_and_validate_vector_metadata(
-            args.steering_vector_path,
-            args.injection_sign,
-            args.injection_site,
-            args.allow_vector_metadata_mismatch,
-        )
         steering_vec_cpu = load_steering_vector(args.steering_vector_path)
         print(f"  vector norm:    {float(steering_vec_cpu.norm().item()):.6f}")
         if vector_metadata is not None:
             print(
                 "  vector metadata: "
                 f"direction={vector_metadata.get('direction') or vector_metadata.get('vector_type')}, "
-                f"site={vector_metadata.get('activation_site')}"
+                f"method={vector_metadata.get('vector_method')}, "
+                f"site={vector_metadata.get('activation_site')}, "
+                f"scope={vector_metadata.get('recommended_injection_scope')}"
             )
     else:
         print("[4/4] Running gammas")
