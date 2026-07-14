@@ -305,6 +305,8 @@ def main() -> None:
         unit_vector = raw_mean / raw_mean_norm
         pair_norms = differences.norm(dim=1)
         margins = differences @ unit_vector
+        target_projections = target_activations[layer_index] @ unit_vector
+        source_projections = source_activations[layer_index] @ unit_vector
         margin_std = margins.std(unbiased=False).clamp_min(1e-12)
         phrasing_cosines = []
         for phrasing_index in range(len(active_phrasings)):
@@ -328,6 +330,14 @@ def main() -> None:
             "mean_projection_margin": float(margins.mean().item()),
             "projection_margin_std": float(margin_std.item()),
             "projection_signal_to_noise": float((margins.mean() / margin_std).item()),
+            "concise_projection_mean": float(target_projections.mean().item()),
+            "concise_projection_std": float(
+                target_projections.std(unbiased=False).item()
+            ),
+            "source_projection_mean": float(source_projections.mean().item()),
+            "source_projection_std": float(
+                source_projections.std(unbiased=False).item()
+            ),
             "phrasing_direction_cosine_mean": float(
                 sum(phrasing_cosines) / len(phrasing_cosines)
             ),
@@ -350,6 +360,14 @@ def main() -> None:
             "recommended_injection_scope": "sequence_all",
             "recommended_injection_token_count": 1,
             "recommended_vector_normalization": "unit_l2",
+            "supported_intervention_modes": ["additive", "projection_match"],
+            "recommended_intervention_mode": "projection_match",
+            "projection_target": float(target_projections.mean().item()),
+            "projection_target_statistic": "concise_final_prompt_token_mean",
+            "projection_source_reference": float(source_projections.mean().item()),
+            "projection_interpolation_formula": (
+                "p_new = p + alpha * (projection_target - p); alpha in [0, 1]"
+            ),
             "matching_prompt_mode": "paper_cot",
             "positive_gamma_only": True,
             "representation_token": "identical_final_prompt_token",
@@ -404,7 +422,9 @@ def main() -> None:
             f"agreement={row['orientation_pair_agreement']:.2%} | "
             f"SNR={row['projection_signal_to_noise']:.3f} | "
             f"resultant={row['mean_resultant_ratio']:.3f} | "
-            f"phrase_cos_min={row['phrasing_direction_cosine_min']:.3f}"
+            f"phrase_cos_min={row['phrasing_direction_cosine_min']:.3f} | "
+            f"proj={row['source_projection_mean']:.3f}"
+            f"->{row['concise_projection_mean']:.3f}"
         )
     print(f"  report: {summary_path}")
 

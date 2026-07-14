@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 import sys
@@ -441,6 +442,7 @@ def load_and_validate_vector_metadata(
     injection_scope: str,
     injection_token_count: int,
     vector_normalization: str,
+    intervention_mode: str,
     prompt_mode: str,
     allow_mismatch: bool,
 ) -> dict[str, Any] | None:
@@ -456,6 +458,7 @@ def load_and_validate_vector_metadata(
     expected_prompt_mode = metadata.get("matching_prompt_mode")
     expected_token_count = metadata.get("recommended_injection_token_count")
     expected_normalization = metadata.get("recommended_vector_normalization")
+    supported_intervention_modes = metadata.get("supported_intervention_modes")
     mismatches = []
     if expected_sign and expected_sign != injection_sign:
         mismatches.append(
@@ -482,6 +485,14 @@ def load_and_validate_vector_metadata(
         mismatches.append(
             f"vector_normalization={vector_normalization!r}, metadata expects "
             f"{expected_normalization!r}"
+        )
+    if (
+        supported_intervention_modes
+        and intervention_mode not in supported_intervention_modes
+    ):
+        mismatches.append(
+            f"intervention_mode={intervention_mode!r}, metadata supports "
+            f"{supported_intervention_modes!r}"
         )
     if mismatches and not allow_mismatch:
         raise ValueError(
@@ -560,12 +571,18 @@ def make_cached_output_steering_hook(
     injection_sign: str,
     injection_scope: str,
     injection_token_count: int,
+    intervention_mode: str = "additive",
+    projection_target: float | None = None,
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
     if injection_scope not in {"prompt_only", "all_tokens", "sequence_all"}:
         raise ValueError(f"Unsupported injection_scope: {injection_scope}")
     multiplier = 1.0 if injection_sign == "add" else -1.0
+    if intervention_mode not in {"additive", "projection_match"}:
+        raise ValueError(f"Unsupported intervention_mode: {intervention_mode}")
+    if intervention_mode == "projection_match" and projection_target is None:
+        raise ValueError("projection_match requires projection_target")
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
     def add_steer(_, __, output):
@@ -582,7 +599,12 @@ def make_cached_output_steering_hook(
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        target[...] = target + multiplier * gamma * steering_vec
+        if intervention_mode == "additive":
+            target[...] = target + multiplier * gamma * steering_vec
+        else:
+            current_projection = (target * steering_vec).sum(dim=-1, keepdim=True)
+            projection_delta = gamma * (projection_target - current_projection)
+            target[...] = target + projection_delta * steering_vec
         return (hidden, *output[1:])
 
     return add_steer
@@ -594,12 +616,18 @@ def make_cached_input_steering_hook(
     injection_sign: str,
     injection_scope: str,
     injection_token_count: int,
+    intervention_mode: str = "additive",
+    projection_target: float | None = None,
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
     if injection_scope not in {"prompt_only", "all_tokens", "sequence_all"}:
         raise ValueError(f"Unsupported injection_scope: {injection_scope}")
     multiplier = 1.0 if injection_sign == "add" else -1.0
+    if intervention_mode not in {"additive", "projection_match"}:
+        raise ValueError(f"Unsupported intervention_mode: {intervention_mode}")
+    if intervention_mode == "projection_match" and projection_target is None:
+        raise ValueError("projection_match requires projection_target")
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
     def add_steer(_module, inputs):
@@ -616,7 +644,12 @@ def make_cached_input_steering_hook(
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        target[...] = target + multiplier * gamma * steering_vec
+        if intervention_mode == "additive":
+            target[...] = target + multiplier * gamma * steering_vec
+        else:
+            current_projection = (target * steering_vec).sum(dim=-1, keepdim=True)
+            projection_delta = gamma * (projection_target - current_projection)
+            target[...] = target + projection_delta * steering_vec
         return (hidden, *inputs[1:])
 
     return add_steer
@@ -785,6 +818,8 @@ def evaluate_gamma(
                     args.injection_sign,
                     args.injection_scope,
                     args.injection_token_count,
+                    args.intervention_mode,
+                    args.resolved_projection_target,
                 )
             )
         elif args.injection_site == "block_output":
@@ -795,6 +830,8 @@ def evaluate_gamma(
                     args.injection_sign,
                     args.injection_scope,
                     args.injection_token_count,
+                    args.intervention_mode,
+                    args.resolved_projection_target,
                 )
             )
         else:
@@ -1017,8 +1054,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Required for nonzero gamma. It must match the activation_site used "
-            "to extract the vector. New vectors should use block_input; "
-            "block_output is retained for legacy ASC vectors."
+            "to extract the vector. ActAdd sequence vectors use block_input; "
+            "ASC and residual-post instruction vectors use block_output."
         ),
     )
     parser.add_argument(
@@ -1050,6 +1087,16 @@ def parse_args() -> argparse.Namespace:
             "Normalize the loaded mean vector before multiplying by gamma. "
             "Literature-aligned instruction vectors require unit_l2; legacy "
             "ASC and existing ActAdd adaptations use none."
+        ),
+    )
+    parser.add_argument(
+        "--intervention_mode",
+        choices=["additive", "projection_match"],
+        default="additive",
+        help=(
+            "additive uses h <- h + gamma*v. projection_match interprets gamma "
+            "as alpha and interpolates each selected residual projection toward "
+            "the concise target stored in vector metadata."
         ),
     )
     parser.add_argument(
@@ -1280,12 +1327,13 @@ def main() -> None:
     if needs_steering_vector and args.injection_site is None:
         raise ValueError(
             "Nonzero gamma requires --injection_site. Use the same site recorded "
-            "in the vector metadata; new ActAdd-aligned vectors use block_input."
+            "in the vector metadata."
         )
     if args.orientation_accuracy_tolerance < 0:
         raise ValueError("--orientation_accuracy_tolerance must be nonnegative.")
 
     vector_metadata = None
+    args.resolved_projection_target = None
     if needs_steering_vector:
         vector_metadata = load_and_validate_vector_metadata(
             args.steering_vector_path,
@@ -1294,9 +1342,38 @@ def main() -> None:
             args.injection_scope,
             args.injection_token_count,
             args.vector_normalization,
+            args.intervention_mode,
             args.prompt_mode,
             args.allow_vector_metadata_mismatch,
         )
+        if args.intervention_mode == "projection_match":
+            if args.injection_sign != "add":
+                raise ValueError(
+                    "projection_match requires --injection_sign add; it moves "
+                    "toward the concise target and does not use sign reversal."
+                )
+            if args.vector_normalization != "unit_l2":
+                raise ValueError(
+                    "projection_match requires --vector_normalization unit_l2."
+                )
+            if vector_metadata is None or "projection_target" not in vector_metadata:
+                raise ValueError(
+                    "projection_match requires vector metadata containing "
+                    "projection_target. Re-run the instruction vector extractor."
+                )
+            projection_target = float(vector_metadata["projection_target"])
+            if not math.isfinite(projection_target):
+                raise ValueError("Vector metadata projection_target must be finite.")
+            args.resolved_projection_target = projection_target
+            if (
+                any(gamma < -1e-12 or gamma > 1.0 + 1e-12 for gamma in candidate_gammas)
+                and not args.allow_vector_metadata_mismatch
+            ):
+                raise ValueError(
+                    "projection_match uses interpolation alpha in [0, 1]. "
+                    "Pass candidates within that range; extrapolation requires "
+                    "--allow_vector_metadata_mismatch and must be labeled diagnostic."
+                )
         if vector_metadata is not None and vector_metadata.get("positive_gamma_only"):
             protocol_errors = []
             vector_method = vector_metadata.get("vector_method") or "positive vector"
@@ -1349,6 +1426,9 @@ def main() -> None:
         print(f"  injection scope:{args.injection_scope}")
         print(f"  injection tokens:{args.injection_token_count}")
         print(f"  vector norm mode:{args.vector_normalization}")
+        print(f"  intervention:   {args.intervention_mode}")
+        if args.intervention_mode == "projection_match":
+            print(f"  projection target:{args.resolved_projection_target:.6f}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)

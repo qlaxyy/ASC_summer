@@ -158,6 +158,12 @@ ASC_phase1/测试.md
 
 ## Gamma 相关说明
 
+投影匹配式简洁性引导的定义、约束与低成本测试命令见
+`docs/PROJECTION_MATCHING_PROTOCOL.md`。该模式使用
+`--intervention_mode projection_match`，其中命令行 gamma 表示 `[0,1]`
+内的投影插值系数，而非
+传统加法向量权重。
+
 目前有两类 gamma 辅助脚本：
 
 ```text
