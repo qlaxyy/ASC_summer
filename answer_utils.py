@@ -7,7 +7,6 @@ It does not depend on data_processing/ or eval/.
 
 from __future__ import annotations
 
-import math
 import re
 from copy import deepcopy
 from typing import Any
@@ -257,6 +256,8 @@ def _tail_candidate(text: str) -> str:
     tail = text[int(len(text) * 0.6):]
 
     final_phrase = _extract_tail_final_candidate(tail)
+    if not final_phrase:
+        final_phrase = _extract_tail_final_candidate(text)
     if final_phrase:
         return final_phrase
 
@@ -310,7 +311,7 @@ def _extract_tail_final_candidate(text: str) -> str:
     )
     for block in reversed(total_blocks):
         eq_candidates = re.findall(
-            r"=\s*("
+            r"=\s*(?:\*\*)?\s*(?:\\?\$\s*)?("
             + _complex_pattern()
             + r"|"
             + _latex_frac_pattern()
