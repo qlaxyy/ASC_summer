@@ -222,6 +222,11 @@ The repository now keeps two explicitly different vector methods:
 - `actadd_prompt_paper_aligned` retains the same shared-suffix intervention but
   restores the evaluator's original `paper_cot` prompt exactly, so gamma zero
   remains comparable with the established baseline.
+- `extract_instruction_conciseness_layers.py` implements a separate,
+  literature-aligned instruction-steering diagnostic: last-token
+  instruction-minus-base directions, unit normalization, simultaneous
+  multi-layer extraction, and `sequence_all` evaluation. See
+  `docs/INSTRUCTION_STEERING_AUDIT.md`.
 
 `actadd_prompt` metadata rejects negative gamma, sign/site/scope mismatches,
 non-`paper_cot` evaluation prompts, and automatic causal vector flipping. See

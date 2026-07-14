@@ -420,6 +420,7 @@ def load_and_validate_vector_metadata(
     injection_site: str,
     injection_scope: str,
     injection_token_count: int,
+    vector_normalization: str,
     prompt_mode: str,
     allow_mismatch: bool,
 ) -> dict[str, Any] | None:
@@ -434,6 +435,7 @@ def load_and_validate_vector_metadata(
     expected_scope = metadata.get("recommended_injection_scope")
     expected_prompt_mode = metadata.get("matching_prompt_mode")
     expected_token_count = metadata.get("recommended_injection_token_count")
+    expected_normalization = metadata.get("recommended_vector_normalization")
     mismatches = []
     if expected_sign and expected_sign != injection_sign:
         mismatches.append(
@@ -455,6 +457,11 @@ def load_and_validate_vector_metadata(
         mismatches.append(
             f"injection_token_count={injection_token_count!r}, metadata expects "
             f"{int(expected_token_count)!r}"
+        )
+    if expected_normalization and expected_normalization != vector_normalization:
+        mismatches.append(
+            f"vector_normalization={vector_normalization!r}, metadata expects "
+            f"{expected_normalization!r}"
         )
     if mismatches and not allow_mismatch:
         raise ValueError(
@@ -511,6 +518,7 @@ def save_causally_oriented_vector(
         "recommended_injection_sign": "add",
         "recommended_injection_scope": args.injection_scope,
         "recommended_injection_token_count": args.injection_token_count,
+        "recommended_vector_normalization": args.vector_normalization,
         "activation_site": args.injection_site,
         "matching_injection_site": args.injection_site,
         "calibration_dataset": args.dataset,
@@ -537,6 +545,8 @@ def make_cached_output_steering_hook(
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
+    if injection_scope not in {"prompt_only", "all_tokens", "sequence_all"}:
+        raise ValueError(f"Unsupported injection_scope: {injection_scope}")
     multiplier = 1.0 if injection_sign == "add" else -1.0
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
@@ -544,17 +554,17 @@ def make_cached_output_steering_hook(
         hidden = output[0]
         if injection_scope == "prompt_only" and hidden.shape[1] <= 1:
             return None
-        if injection_scope != "prompt_only" and injection_scope != "all_tokens":
-            raise ValueError(f"Unsupported injection_scope: {injection_scope}")
-        target = hidden[:, -injection_token_count:, :]
+        target = (
+            hidden
+            if injection_scope == "sequence_all"
+            else hidden[:, -injection_token_count:, :]
+        )
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        hidden[:, -injection_token_count:, :] = (
-            target + multiplier * gamma * steering_vec
-        )
+        target[...] = target + multiplier * gamma * steering_vec
         return (hidden, *output[1:])
 
     return add_steer
@@ -569,6 +579,8 @@ def make_cached_input_steering_hook(
 ):
     if injection_sign not in {"add", "subtract"}:
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
+    if injection_scope not in {"prompt_only", "all_tokens", "sequence_all"}:
+        raise ValueError(f"Unsupported injection_scope: {injection_scope}")
     multiplier = 1.0 if injection_sign == "add" else -1.0
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
@@ -576,17 +588,17 @@ def make_cached_input_steering_hook(
         hidden = inputs[0]
         if injection_scope == "prompt_only" and hidden.shape[1] <= 1:
             return None
-        if injection_scope != "prompt_only" and injection_scope != "all_tokens":
-            raise ValueError(f"Unsupported injection_scope: {injection_scope}")
-        target = hidden[:, -injection_token_count:, :]
+        target = (
+            hidden
+            if injection_scope == "sequence_all"
+            else hidden[:, -injection_token_count:, :]
+        )
         key = (str(target.device), target.dtype)
         steering_vec = cache.get(key)
         if steering_vec is None:
             steering_vec = steering_vec_cpu.to(device=target.device, dtype=target.dtype)
             cache[key] = steering_vec
-        hidden[:, -injection_token_count:, :] = (
-            target + multiplier * gamma * steering_vec
-        )
+        target[...] = target + multiplier * gamma * steering_vec
         return (hidden, *inputs[1:])
 
     return add_steer
@@ -989,12 +1001,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--injection_scope",
-        choices=["all_tokens", "prompt_only"],
+        choices=["all_tokens", "prompt_only", "sequence_all"],
         default="all_tokens",
         help=(
-            "all_tokens steers the prompt and every cached generation step as "
-            "in legacy ASC. prompt_only steers only the last prompt token on "
-            "the initial forward pass, as required by actadd_prompt vectors."
+            "all_tokens preserves legacy ASC behavior: configured final prompt "
+            "positions plus every cached generation step. prompt_only steers "
+            "only the configured final prompt positions. sequence_all adds the "
+            "vector to every prompt and generated position, matching published "
+            "instruction-steering implementations."
         ),
     )
     parser.add_argument(
@@ -1004,6 +1018,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of final prompt positions receiving the vector. It must "
             "match vector metadata; legacy and actadd_prompt v1 vectors use 1."
+        ),
+    )
+    parser.add_argument(
+        "--vector_normalization",
+        choices=["none", "unit_l2"],
+        default="none",
+        help=(
+            "Normalize the loaded mean vector before multiplying by gamma. "
+            "Literature-aligned instruction vectors require unit_l2; legacy "
+            "ASC and existing ActAdd adaptations use none."
         ),
     )
     parser.add_argument(
@@ -1235,6 +1259,7 @@ def main() -> None:
             args.injection_site,
             args.injection_scope,
             args.injection_token_count,
+            args.vector_normalization,
             args.prompt_mode,
             args.allow_vector_metadata_mismatch,
         )
@@ -1243,19 +1268,21 @@ def main() -> None:
             and vector_metadata.get("positive_gamma_only")
         ):
             protocol_errors = []
+            vector_method = vector_metadata.get("vector_method") or "positive vector"
             if any(gamma < -1e-12 for gamma in candidate_gammas):
                 protocol_errors.append(
-                    "actadd_prompt is a target-minus-source theory test and accepts "
-                    "only gamma >= 0"
+                    f"{vector_method} is a declared positive-direction test and "
+                    "accepts only gamma >= 0"
                 )
             if args.orient_vector_output_path is not None:
                 protocol_errors.append(
-                    "actadd_prompt cannot be passed to --orient_vector_output_path; "
-                    "the raw short-minus-long direction must remain unchanged"
+                    f"{vector_method} cannot be passed to "
+                    "--orient_vector_output_path; its declared direction must "
+                    "remain unchanged"
                 )
             if protocol_errors and not args.allow_vector_metadata_mismatch:
                 raise ValueError(
-                    "ActAdd prompt-vector protocol violation: "
+                    "Positive steering-vector protocol violation: "
                     + "; ".join(protocol_errors)
                     + ". Pass --allow_vector_metadata_mismatch only for an explicitly "
                     "labeled diagnostic experiment."
@@ -1288,6 +1315,7 @@ def main() -> None:
         print(f"  injection site: {args.injection_site}")
         print(f"  injection scope:{args.injection_scope}")
         print(f"  injection tokens:{args.injection_token_count}")
+        print(f"  vector norm mode:{args.vector_normalization}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)
@@ -1334,7 +1362,14 @@ def main() -> None:
     if needs_steering_vector:
         print("[4/4] Loading steering vector and running gammas")
         steering_vec_cpu = load_steering_vector(args.steering_vector_path)
+        raw_vector_norm = float(steering_vec_cpu.norm().item())
+        if args.vector_normalization == "unit_l2":
+            if raw_vector_norm <= 1e-12:
+                raise ValueError("Cannot unit-normalize a near-zero steering vector.")
+            steering_vec_cpu = steering_vec_cpu / raw_vector_norm
         print(f"  vector norm:    {float(steering_vec_cpu.norm().item()):.6f}")
+        if args.vector_normalization == "unit_l2":
+            print(f"  raw vector norm:{raw_vector_norm:.6f}")
         if vector_metadata is not None:
             print(
                 "  vector metadata: "
@@ -1342,7 +1377,8 @@ def main() -> None:
                 f"method={vector_metadata.get('vector_method')}, "
                 f"site={vector_metadata.get('activation_site')}, "
                 f"scope={vector_metadata.get('recommended_injection_scope')}, "
-                f"tokens={vector_metadata.get('recommended_injection_token_count')}"
+                f"tokens={vector_metadata.get('recommended_injection_token_count')}, "
+                f"normalization={vector_metadata.get('recommended_vector_normalization')}"
             )
     else:
         print("[4/4] Running gammas")
