@@ -35,6 +35,16 @@ CONCISE_INSTRUCTION_PHRASINGS = (
     "Use minimal mathematical reasoning.",
 )
 
+VERBOSE_INSTRUCTION_PHRASINGS = (
+    "Be extremely detailed.",
+    "Be extremely thorough.",
+    "Make the reasoning extensive and fully elaborated.",
+    "Show every relevant mathematical step.",
+    "Include repeated verification and extensive explanatory prose.",
+    "Give fully elaborated reasoning.",
+    "Use extensive mathematical reasoning.",
+)
+
 
 def torch_dtype_from_arg(name: str) -> Any:
     if name == "auto":
@@ -68,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--problems_path", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--file_prefix", default="qwen7b_instruction_conciseness")
+    parser.add_argument(
+        "--contrast_mode",
+        choices=["concise_vs_base", "concise_vs_verbose"],
+        default="concise_vs_base",
+        help=(
+            "Use the published instruction-vs-base contrast, or a matched "
+            "concise-vs-verbose contrast that cancels the generic instruction prefix."
+        ),
+    )
     parser.add_argument("--layer_indices", default="8,12,16,20,24")
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument("--max_input_tokens", type=int, default=8192)
@@ -88,10 +107,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_prompt_pair(problem: str, phrasing_index: int) -> tuple[str, str]:
-    source = utils.ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
+def build_prompt_pair(
+    problem: str,
+    phrasing_index: int,
+    contrast_mode: str,
+) -> tuple[str, str]:
+    base = utils.ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
     instruction = CONCISE_INSTRUCTION_PHRASINGS[phrasing_index]
-    target = f"Reasoning instruction: {instruction}\n{source}"
+    target = f"Reasoning instruction: {instruction}\n{base}"
+    if contrast_mode == "concise_vs_base":
+        source = base
+    elif contrast_mode == "concise_vs_verbose":
+        verbose_instruction = VERBOSE_INSTRUCTION_PHRASINGS[phrasing_index]
+        source = f"Reasoning instruction: {verbose_instruction}\n{base}"
+    else:
+        raise ValueError(f"Unsupported contrast mode: {contrast_mode}")
     return target, source
 
 
@@ -206,7 +236,11 @@ def main() -> None:
     ]
     phrasing_indices = [index % len(active_phrasings) for index in range(len(rows))]
     prompt_pairs = [
-        build_prompt_pair(utils.problem_from_row(row), phrasing_index)
+        build_prompt_pair(
+            utils.problem_from_row(row),
+            phrasing_index,
+            args.contrast_mode,
+        )
         for row, phrasing_index in zip(rows, phrasing_indices)
     ]
     target_prompts = [pair[0] for pair in prompt_pairs]
@@ -230,6 +264,7 @@ def main() -> None:
     print("Instruction-conciseness layer extraction")
     print(f"  model:        {args.model_name}")
     print(f"  source:       {source_path}")
+    print(f"  contrast:     {args.contrast_mode}")
     print(f"  samples:      {len(rows)}")
     print(f"  layers:       {layer_indices}")
     print(f"  final-token agreement: {suffix_agreement:.2%}")
@@ -253,7 +288,7 @@ def main() -> None:
         layer_indices,
         args.max_input_tokens,
         args.activation_batch_size,
-        "Source paper prompts",
+        "Source contrast prompts",
     )
 
     output_dir = Path(args.output_dir)
@@ -306,8 +341,8 @@ def main() -> None:
         metadata = {
             **report,
             "model_name": args.model_name,
-            "vector_method": "instruction_conciseness",
-            "direction": "concise_instruction_minus_base_prompt",
+            "vector_method": f"instruction_conciseness_{args.contrast_mode}",
+            "direction": f"{args.contrast_mode}_target_minus_source",
             "formula": "unit(mean_i(h(target_i)[-1] - h(source_i)[-1]))",
             "activation_site": "block_output",
             "matching_injection_site": "block_output",
@@ -327,6 +362,11 @@ def main() -> None:
             "target_prompt_example": target_prompts[0],
             "source_prompt_example": source_prompts[0],
             "concise_instruction_phrasings": list(active_phrasings),
+            "verbose_instruction_phrasings": (
+                list(VERBOSE_INSTRUCTION_PHRASINGS[: len(active_phrasings)])
+                if args.contrast_mode == "concise_vs_verbose"
+                else []
+            ),
             "concise_instruction_phrasing_indices": phrasing_indices,
             "final_token_agreement": suffix_agreement,
             "saved_vector_is_unit_l2": True,
@@ -345,7 +385,7 @@ def main() -> None:
         reverse=True,
     )
     summary = {
-        "method": "instruction_conciseness",
+        "method": f"instruction_conciseness_{args.contrast_mode}",
         "model_name": args.model_name,
         "layers": layer_reports,
         "diagnostic_ranking": [row["layer_index"] for row in ranking],

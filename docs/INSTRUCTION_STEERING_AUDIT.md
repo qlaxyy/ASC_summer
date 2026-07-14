@@ -186,3 +186,49 @@ python eval_asc_paper.py \
 
 Only if a layer shows a coherent length trend without accuracy/output collapse
 should it be confirmed on 100 examples using the paper sampling settings.
+
+## Matched length-axis contrast after the base-contrast result
+
+The multi-phrasing `concise_vs_base` vector at layer 8 shortened greedy output
+at weight 2, but did not transfer to the ASC sampling configuration. On 30
+paired-seed GSM8K examples, weights `1,2,3` changed average tokens from the
+664.0 baseline to `812.9,850.3,695.1`; none compressed. This rejects that vector
+as a robust compression intervention.
+
+Cross-phrasing consistency alone was insufficient because every target prompt
+contained a `Reasoning instruction:` prefix while every source prompt lacked
+one. The common representation may therefore encode the presence of an extra
+instruction rather than its conciseness semantics.
+
+The matched contrast keeps the wrapper, problem, CoT prompt, and final token on
+both sides:
+
+```text
+target(q) = Reasoning instruction: <concise phrasing>
+            Question: q
+            Let's think step by step.
+
+source(q) = Reasoning instruction: <matched verbose phrasing>
+            Question: q
+            Let's think step by step.
+```
+
+It saves the explicitly oriented unit direction
+`unit(mean(h(concise) - h(verbose)))`. Positive addition therefore retains the
+intended concise semantic sign without relabeling or post-hoc vector reversal.
+
+```bash
+python extract_instruction_conciseness_layers.py \
+  --model_name /root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --problems_path datasets/gsm8k/train.jsonl \
+  --output_dir vectors/instruction_length_axis_gsm8k_train100 \
+  --file_prefix qwen7b_instruction_length_axis \
+  --contrast_mode concise_vs_verbose \
+  --layer_indices 8,12,16,20,24 \
+  --num_samples 100 \
+  --activation_batch_size 8 \
+  --max_input_tokens 8192 \
+  --device_map auto \
+  --dtype bfloat16 \
+  --attn_impl sdpa
+```
