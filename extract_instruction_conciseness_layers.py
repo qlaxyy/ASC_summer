@@ -25,6 +25,17 @@ from tqdm import tqdm
 import asc_steering_utils as utils
 
 
+CONCISE_INSTRUCTION_PHRASINGS = (
+    "Be extremely concise.",
+    "Be extremely brief.",
+    "Keep the reasoning extremely short.",
+    "Use only the essential mathematical steps.",
+    "Avoid repeated verification and unnecessary prose.",
+    "Give the shortest sufficient reasoning.",
+    "Use minimal mathematical reasoning.",
+)
+
+
 def torch_dtype_from_arg(name: str) -> Any:
     if name == "auto":
         return "auto"
@@ -77,9 +88,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_prompt_pair(problem: str) -> tuple[str, str]:
-    target = utils.ACTADD_PAPER_ALIGNED_SHORT_PROMPT_TEMPLATE.format(problem=problem)
+def build_prompt_pair(problem: str, phrasing_index: int) -> tuple[str, str]:
     source = utils.ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
+    instruction = CONCISE_INSTRUCTION_PHRASINGS[phrasing_index]
+    target = f"Reasoning instruction: {instruction}\n{source}"
     return target, source
 
 
@@ -115,6 +127,7 @@ def extract_multi_layer_last_token_activations(
             handles = []
 
             for layer_index in layer_indices:
+
                 def capture_hook(
                     _module: Any,
                     _hook_inputs: Any,
@@ -123,15 +136,10 @@ def extract_multi_layer_last_token_activations(
                     current_layer: int = layer_index,
                 ) -> None:
                     captured[current_layer] = (
-                        utils.first_tensor(output)[:, -1, :]
-                        .detach()
-                        .float()
-                        .cpu()
+                        utils.first_tensor(output)[:, -1, :].detach().float().cpu()
                     )
 
-                handles.append(
-                    layers[layer_index].register_forward_hook(capture_hook)
-                )
+                handles.append(layers[layer_index].register_forward_hook(capture_hook))
 
             inputs = tokenizer(
                 batch,
@@ -193,7 +201,14 @@ def main() -> None:
         )
         rows = [rows[index] for index in selected_indices]
 
-    prompt_pairs = [build_prompt_pair(utils.problem_from_row(row)) for row in rows]
+    active_phrasings = CONCISE_INSTRUCTION_PHRASINGS[
+        : min(len(rows), len(CONCISE_INSTRUCTION_PHRASINGS))
+    ]
+    phrasing_indices = [index % len(active_phrasings) for index in range(len(rows))]
+    prompt_pairs = [
+        build_prompt_pair(utils.problem_from_row(row), phrasing_index)
+        for row, phrasing_index in zip(rows, phrasing_indices)
+    ]
     target_prompts = [pair[0] for pair in prompt_pairs]
     source_prompts = [pair[1] for pair in prompt_pairs]
 
@@ -202,7 +217,9 @@ def main() -> None:
     for target, source in prompt_pairs:
         target_ids = tokenizer(target)["input_ids"]
         source_ids = tokenizer(source)["input_ids"]
-        suffix_matches.append(bool(target_ids and source_ids and target_ids[-1] == source_ids[-1]))
+        suffix_matches.append(
+            bool(target_ids and source_ids and target_ids[-1] == source_ids[-1])
+        )
     suffix_agreement = sum(suffix_matches) / len(suffix_matches)
     if suffix_agreement < 1.0:
         raise ValueError(
@@ -254,6 +271,15 @@ def main() -> None:
         pair_norms = differences.norm(dim=1)
         margins = differences @ unit_vector
         margin_std = margins.std(unbiased=False).clamp_min(1e-12)
+        phrasing_cosines = []
+        for phrasing_index in range(len(active_phrasings)):
+            mask = torch.tensor(
+                [index == phrasing_index for index in phrasing_indices],
+                dtype=torch.bool,
+            )
+            phrasing_mean = differences[mask].mean(dim=0)
+            phrasing_mean = phrasing_mean / phrasing_mean.norm().clamp_min(1e-12)
+            phrasing_cosines.append(float((phrasing_mean @ unit_vector).item()))
         report = {
             "layer_index": layer_index,
             "num_vectors": int(differences.shape[0]),
@@ -263,14 +289,15 @@ def main() -> None:
             "mean_resultant_ratio": float(
                 (raw_mean_norm / pair_norms.mean().clamp_min(1e-12)).item()
             ),
-            "orientation_pair_agreement": float(
-                (margins > 0).float().mean().item()
-            ),
+            "orientation_pair_agreement": float((margins > 0).float().mean().item()),
             "mean_projection_margin": float(margins.mean().item()),
             "projection_margin_std": float(margin_std.item()),
-            "projection_signal_to_noise": float(
-                (margins.mean() / margin_std).item()
+            "projection_signal_to_noise": float((margins.mean() / margin_std).item()),
+            "phrasing_direction_cosine_mean": float(
+                sum(phrasing_cosines) / len(phrasing_cosines)
             ),
+            "phrasing_direction_cosine_min": float(min(phrasing_cosines)),
+            "phrasing_direction_cosines": phrasing_cosines,
         }
         vector_path = output_dir / f"{args.file_prefix}_layer{layer_index}.pt"
         torch.save(unit_vector.cpu(), vector_path)
@@ -299,6 +326,8 @@ def main() -> None:
             "sample_seed": args.seed,
             "target_prompt_example": target_prompts[0],
             "source_prompt_example": source_prompts[0],
+            "concise_instruction_phrasings": list(active_phrasings),
+            "concise_instruction_phrasing_indices": phrasing_indices,
             "final_token_agreement": suffix_agreement,
             "saved_vector_is_unit_l2": True,
             "created_at_unix": created_at,
@@ -309,6 +338,7 @@ def main() -> None:
     ranking = sorted(
         layer_reports,
         key=lambda row: (
+            row["phrasing_direction_cosine_min"],
             row["projection_signal_to_noise"],
             row["mean_resultant_ratio"],
         ),
@@ -333,7 +363,8 @@ def main() -> None:
             f"  layer={row['layer_index']:>2} | "
             f"agreement={row['orientation_pair_agreement']:.2%} | "
             f"SNR={row['projection_signal_to_noise']:.3f} | "
-            f"resultant={row['mean_resultant_ratio']:.3f}"
+            f"resultant={row['mean_resultant_ratio']:.3f} | "
+            f"phrase_cos_min={row['phrasing_direction_cosine_min']:.3f}"
         )
     print(f"  report: {summary_path}")
 

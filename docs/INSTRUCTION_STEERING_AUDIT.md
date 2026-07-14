@@ -92,10 +92,16 @@ preserving the established paper CoT baseline:
 source(q) = Question: q
             Let's think step by step.
 
-target(q) = Reasoning instruction: Be concise and direct. ...
+target(q) = Reasoning instruction: <one concise instruction>
             Question: q
             Let's think step by step.
 ```
+
+The concise instruction is assigned round-robin from seven semantically
+equivalent phrasings (for example, "Be extremely concise" and "Use only the
+essential mathematical steps"). This follows the reference implementation's
+use of varied length instructions more closely and reduces the risk that the
+saved vector primarily represents one fixed sentence.
 
 The final token is identical. At each candidate layer:
 
@@ -113,7 +119,16 @@ h_l[:, :, :] <- h_l[:, :, :] + weight * v_l
 
 The first diagnostic extracts layers `8,12,16,20,24` simultaneously. Its
 representation ranking is only a filter; it cannot replace causal generation
-tests.
+tests. In addition to agreement, SNR, and resultant ratio, it reports
+`phrase_cos_min`: the minimum cosine between each phrasing subgroup's mean
+direction and the overall mean direction. A positive value for every phrasing
+is evidence that the common direction survives wording changes; it is not proof
+that the direction causally shortens generated answers.
+
+The initial fixed-phrase run ranked layers 16 and 12 above layer 20, but its
+100% agreement and high resultant ratios can include fixed-instruction lexical
+content. Treat that run as preliminary and use the multi-phrasing extraction
+below before selecting layers for generation.
 
 ## Low-cost layer extraction
 
@@ -121,7 +136,7 @@ tests.
 python extract_instruction_conciseness_layers.py \
   --model_name /root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
   --problems_path datasets/gsm8k/train.jsonl \
-  --output_dir vectors/instruction_conciseness_gsm8k_train100 \
+  --output_dir vectors/instruction_conciseness_gsm8k_train100_multiphrase \
   --file_prefix qwen7b_instruction_conciseness \
   --layer_indices 8,12,16,20,24 \
   --num_samples 100 \
@@ -150,7 +165,7 @@ python eval_asc_paper.py \
   --limit 30 \
   --prompt_mode paper_cot \
   --candidate_gammas 0,5,10,20 \
-  --steering_vector_path vectors/instruction_conciseness_gsm8k_train100/qwen7b_instruction_conciseness_layer{LAYER}.pt \
+  --steering_vector_path vectors/instruction_conciseness_gsm8k_train100_multiphrase/qwen7b_instruction_conciseness_layer{LAYER}.pt \
   --layer_index {LAYER} \
   --injection_sign add \
   --injection_site block_output \
