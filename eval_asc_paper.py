@@ -136,6 +136,12 @@ def build_paper_prompt(
         return problem
     if mode == "paper_cot":
         return ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
+    if mode == "paper_cot_concise_prefix":
+        base = ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
+        return f"Reasoning instruction: Be extremely concise.\n{base}"
+    if mode == "paper_cot_verbose_prefix":
+        base = ACTADD_LONG_PROMPT_TEMPLATE.format(problem=problem)
+        return f"Reasoning instruction: Be extremely detailed.\n{base}"
     if mode == "actadd_aligned_long":
         return ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE.format(problem=problem)
     if mode == "paper_boxed_cot":
@@ -153,7 +159,9 @@ def build_paper_prompt(
                 f"Question: {problem}\n"
                 "Let's think step by step. Put the final answer in \\boxed{}."
             )
-        if qwen3_enable_thinking and is_qwen3_model_name(getattr(tokenizer, "name_or_path", "")):
+        if qwen3_enable_thinking and is_qwen3_model_name(
+            getattr(tokenizer, "name_or_path", "")
+        ):
             content = (
                 f"Question: {problem}\n"
                 "Please reason step by step, and put your final answer within \\boxed{}."
@@ -291,9 +299,15 @@ def parse_candidate_gammas(
     return deduped
 
 
-def resolve_candidate_gammas(args: argparse.Namespace, cfg: dict[str, Any]) -> list[float]:
+def resolve_candidate_gammas(
+    args: argparse.Namespace, cfg: dict[str, Any]
+) -> list[float]:
     if args.candidate_gammas is not None:
-        gamma_max = args.gamma_max if args.gamma_max is not None else float(cfg.get("gamma", 1.0))
+        gamma_max = (
+            args.gamma_max
+            if args.gamma_max is not None
+            else float(cfg.get("gamma", 1.0))
+        )
         return parse_candidate_gammas(
             args.candidate_gammas,
             gamma_min=args.gamma_min,
@@ -311,7 +325,11 @@ def resolve_candidate_gammas(args: argparse.Namespace, cfg: dict[str, Any]) -> l
             include_zero=args.include_zero,
         )
 
-    gamma = args.gamma_override if args.steering and args.gamma_override is not None else 0.0
+    gamma = (
+        args.gamma_override
+        if args.steering and args.gamma_override is not None
+        else 0.0
+    )
     if args.steering and args.gamma_override is None:
         if "gamma" not in cfg:
             raise ValueError(
@@ -410,7 +428,9 @@ def load_steering_vector(path: str) -> torch.Tensor:
     if steering_vec_cpu.ndim == 2:
         steering_vec_cpu = steering_vec_cpu.mean(dim=0)
     elif steering_vec_cpu.ndim != 1:
-        raise ValueError(f"Unexpected steering vector shape: {tuple(steering_vec_cpu.shape)}")
+        raise ValueError(
+            f"Unexpected steering vector shape: {tuple(steering_vec_cpu.shape)}"
+        )
     return steering_vec_cpu
 
 
@@ -527,9 +547,7 @@ def save_causally_oriented_vector(
         "accuracy_tolerance": float(args.orientation_accuracy_tolerance),
         "baseline": strip_details_for_summary(baseline),
         "selected": strip_details_for_summary(selected),
-        "candidate_results": [
-            strip_details_for_summary(row) for row in gamma_results
-        ],
+        "candidate_results": [strip_details_for_summary(row) for row in gamma_results],
         "formula": "v_compress = orientation_multiplier * v_base; h <- h + gamma*v_compress",
     }
     write_json_atomic(str(output_path) + ".metadata.json", metadata)
@@ -634,22 +652,24 @@ def run_batch(
         enabled=autocast_enabled,
     ):
         generation_kwargs: dict[str, Any] = dict(inputs)
+        do_sample = temperature > 0
         generation_kwargs.update(
             {
                 "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "do_sample": temperature > 0,
-                "top_p": top_p,
+                "do_sample": do_sample,
                 "pad_token_id": tokenizer.pad_token_id,
                 "eos_token_id": tokenizer.eos_token_id,
                 "use_cache": True,
                 "repetition_penalty": repetition_penalty,
             }
         )
-        if top_k is not None and top_k > 0:
-            generation_kwargs["top_k"] = top_k
-        if min_p is not None:
-            generation_kwargs["min_p"] = min_p
+        if do_sample:
+            generation_kwargs["temperature"] = temperature
+            generation_kwargs["top_p"] = top_p
+            if top_k is not None and top_k > 0:
+                generation_kwargs["top_k"] = top_k
+            if min_p is not None:
+                generation_kwargs["min_p"] = min_p
 
         try:
             outputs = model.generate(**generation_kwargs)
@@ -664,8 +684,8 @@ def run_batch(
         outputs[:, prompt_len:], skip_special_tokens=True
     )
     token_counts = (
-        outputs[:, prompt_len:] != tokenizer.pad_token_id
-    ).sum(dim=1).tolist()
+        (outputs[:, prompt_len:] != tokenizer.pad_token_id).sum(dim=1).tolist()
+    )
     return generations, token_counts
 
 
@@ -801,8 +821,10 @@ def evaluate_gamma(
             pbar = tqdm(range(0, total, args.batch_size), desc=desc)
 
             for i in pbar:
+                batch_index = i // args.batch_size
+                if args.deterministic_batch_seeds:
+                    set_seed(args.seed + run_idx * 1_000_000 + batch_index)
                 if args.paired_batch_seeds:
-                    batch_index = i // args.batch_size
                     state_key = (run_idx, batch_index)
                     if abs(gamma) <= 1e-12:
                         paired_rng_states[state_key] = capture_rng_state()
@@ -918,9 +940,7 @@ def evaluate_gamma(
     avg_tokens = [row["avg_tokens"] for row in run_metrics]
     avg_times = [row["avg_time_sec"] for row in run_metrics]
     length_capped_rates = [row["length_capped_rate"] for row in run_metrics]
-    repetition_artifact_rates = [
-        row["repetition_artifact_rate"] for row in run_metrics
-    ]
+    repetition_artifact_rates = [row["repetition_artifact_rate"] for row in run_metrics]
     correct_mean = int(round(float(np.mean([row["correct"] for row in run_metrics]))))
 
     return {
@@ -954,7 +974,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="/root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     )
-    parser.add_argument("--dataset", type=str, default="gsm8k", choices=["gsm8k", "math"])
+    parser.add_argument(
+        "--dataset", type=str, default="gsm8k", choices=["gsm8k", "math"]
+    )
     parser.add_argument("--local_data_path", type=str, default=None)
     parser.add_argument("--steering", action="store_true")
     parser.add_argument("--gamma_override", type=float, default=None)
@@ -1065,13 +1087,17 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "raw",
             "paper_cot",
+            "paper_cot_concise_prefix",
+            "paper_cot_verbose_prefix",
             "actadd_aligned_long",
             "paper_boxed_cot",
             "chat_paper_cot",
             "chat_boxed_cot",
         ],
     )
-    parser.add_argument("--output_path", type=str, default="./eval_asc_paper_results.json")
+    parser.add_argument(
+        "--output_path", type=str, default="./eval_asc_paper_results.json"
+    )
     parser.add_argument(
         "--per_gamma_output_dir",
         type=str,
@@ -1093,6 +1119,14 @@ def parse_args() -> argparse.Namespace:
             "Run gamma=0 first, record its natural per-batch RNG states, and "
             "replay those states for every nonzero gamma. This preserves the "
             "ordinary baseline sampling trajectory while pairing comparisons."
+        ),
+    )
+    parser.add_argument(
+        "--deterministic_batch_seeds",
+        action="store_true",
+        help=(
+            "Reset RNG from seed and batch index before every batch. Separate "
+            "runs with different prompt modes then use paired sampler states."
         ),
     )
     parser.add_argument(
@@ -1263,10 +1297,7 @@ def main() -> None:
             args.prompt_mode,
             args.allow_vector_metadata_mismatch,
         )
-        if (
-            vector_metadata is not None
-            and vector_metadata.get("positive_gamma_only")
-        ):
+        if vector_metadata is not None and vector_metadata.get("positive_gamma_only"):
             protocol_errors = []
             vector_method = vector_metadata.get("vector_method") or "positive vector"
             if any(gamma < -1e-12 for gamma in candidate_gammas):
@@ -1307,7 +1338,9 @@ def main() -> None:
     print(f"  batch_size:     {args.batch_size}")
     print(f"  max_new_tokens: {args.max_new_tokens}")
     print(f"  device_map:     {args.resolved_device_map}")
-    print("  gammas:         " + ", ".join(f"{gamma:.6g}" for gamma in candidate_gammas))
+    print(
+        "  gammas:         " + ", ".join(f"{gamma:.6g}" for gamma in candidate_gammas)
+    )
     if needs_steering_vector:
         print(f"  vector:         {args.steering_vector_path}")
         print(f"  layer:          {args.layer_index}")
@@ -1325,7 +1358,9 @@ def main() -> None:
         print(f"  cuda devices:   {torch.cuda.device_count()}")
         for idx in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(idx)
-            print(f"    cuda:{idx}: {props.name}, {props.total_memory / 1024**3:.1f} GiB")
+            print(
+                f"    cuda:{idx}: {props.name}, {props.total_memory / 1024**3:.1f} GiB"
+            )
     else:
         print("  [warn] CUDA is not available.")
 
@@ -1474,7 +1509,9 @@ def main() -> None:
                 partial = {
                     "config": vars(args),
                     "candidate_gammas": candidate_gammas,
-                    "completed": [strip_details_for_summary(item) for item in gamma_results],
+                    "completed": [
+                        strip_details_for_summary(item) for item in gamma_results
+                    ],
                     "stopped_early": stopped_early,
                     "stop_reason": stop_reason,
                 }

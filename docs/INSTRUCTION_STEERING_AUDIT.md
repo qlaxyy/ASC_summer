@@ -147,6 +147,54 @@ python extract_instruction_conciseness_layers.py \
   --attn_impl sdpa
 ```
 
+The matched vector also failed the ASC sampling test at layer 20. With the same
+30-example baseline of 664.0 tokens, positive weights `1,2,3` produced
+`810.1,974.9,848.0` tokens. Do not interpret its higher accuracies as a
+compression gain; they were accompanied by substantially longer reasoning.
+
+## Required prompt-level behavioral control
+
+An audit of the official `microsoft/llm-steer-instruct` code confirms that it
+extracts and adds at TransformerLens `resid_post`, corresponding to the current
+Hugging Face `block_output` implementation. The site is not the cause of the
+failed sampling result. The official length experiment, however, generates
+greedily. Thus the earlier greedy shortening is valid only as a result under
+that protocol and does not establish robustness under ASC sampling.
+
+Before extracting another vector, directly test whether this reasoning model
+obeys the concise/verbose prompts used to define the contrast. The two runs
+below reset RNG by batch index, so their sampling states are paired despite
+being separate processes:
+
+```bash
+for MODE in paper_cot_concise_prefix paper_cot_verbose_prefix; do
+  python eval_asc_paper.py \
+    --model_name /root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --dataset gsm8k \
+    --local_data_path datasets/gsm8k/test.jsonl \
+    --limit 30 \
+    --prompt_mode "$MODE" \
+    --candidate_gammas 0 \
+    --batch_size 8 \
+    --max_new_tokens 4096 \
+    --temperature 0.7 \
+    --top_p 0.9 \
+    --repetition_penalty 1.1 \
+    --deterministic_batch_seeds \
+    --seed 42 \
+    --attn_impl sdpa \
+    --save_details all \
+    --use_our_eval \
+    --output_path "results/prompt_control_${MODE}.json"
+done
+```
+
+If the concise prompt is not materially shorter than the verbose prompt, this
+instruction contrast has no behavioral target on DeepSeek-R1-Distill-Qwen-7B
+and should be abandoned. If it is shorter, the failure lies in converting a
+valid prompt effect into an activation intervention, and prompt placement,
+layer selection, and intervention protocol can then be studied separately.
+
 This performs 100 target and 100 source prompt forwards while capturing all five
 layers together. It does not generate answers. Use the printed ranking to select
 two candidate layers for a small greedy causal test before returning to the ASC
