@@ -69,7 +69,10 @@ the model ignoring length instructions. The failure occurs when a distributed
 prompt effect is reduced to one mean residual direction and applied through
 unconstrained additive steering.
 
-The next justified intervention is projection matching: estimate the concise
-prompt's scalar projection on the learned unit direction, then interpolate the
-inference residual toward that measured target. This should be implemented and
-validated separately from additive ASC gamma sweeps.
+Projection matching was subsequently implemented and tested separately from
+additive ASC gamma sweeps. It also increased output length at every tested
+nonzero interpolation value. Together, these results show that neither a
+single mean displacement nor a single scalar residual projection transports
+the distributed prompt effect under ASC sampling. The concise prompt remains a
+successful behavioral baseline; the one-dimensional activation interventions
+are documented negative results.

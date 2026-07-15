@@ -121,3 +121,24 @@ python eval_asc_paper.py \
 
 The CLI retains the historical name `candidate_gammas`; in projection mode the
 printed gamma value is mathematically `alpha`, not an additive vector weight.
+
+## Observed result and status
+
+The layer-20 projection-matching screen was run on 30 GSM8K examples with ASC
+sampling and paired batch RNG states:
+
+| alpha | accuracy | average tokens | change from alpha 0 |
+|---:|---:|---:|---:|
+| 0.00 | 80.00% | 664.0 | baseline |
+| 0.10 | 90.00% | 768.3 | +15.7% |
+| 0.25 | 86.67% | 873.9 | +31.6% |
+| 0.50 | 86.67% | 698.3 | +5.2% |
+
+Every nonzero interpolation increased output length. The apparent accuracy
+improvements were accompanied by longer reasoning and are not compression
+gains. This rejects scalar projection matching as a compression intervention
+for this model and decoding protocol. Do not escalate to `alpha=1`, change the
+sign, or search additional layers merely to obtain a favorable sample.
+
+The implementation remains in the repository as a documented negative result
+and reusable diagnostic. It must not be presented as a successful ASC variant.
