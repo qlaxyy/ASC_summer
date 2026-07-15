@@ -235,6 +235,39 @@ def has_repetition_artifact(generation: str) -> bool:
     return False
 
 
+def has_obvious_corruption_artifact(generation: str) -> bool:
+    """Detect unmistakable decoding corruption without judging writing quality.
+
+    Non-ASCII text, LaTeX, and multilingual answers are valid.  This detector is
+    intentionally limited to replacement characters, common UTF-8 mojibake, raw
+    byte-token dumps, and unexpected control characters.
+    """
+
+    if "\ufffd" in generation:
+        return True
+    mojibake_markers = (
+        "ï¿½",
+        "Ã©",
+        "Ã¨",
+        "Ã±",
+        "Ã¼",
+        "Â ",
+        "â€™",
+        "â€œ",
+        "â€\x9d",
+        "â€“",
+        "â€”",
+    )
+    if any(marker in generation for marker in mojibake_markers):
+        return True
+    if re.search(r"(?:<0x[0-9A-Fa-f]{2}>\s*){3,}", generation):
+        return True
+    return any(
+        ord(char) < 32 and char not in {"\n", "\r", "\t"}
+        for char in generation
+    )
+
+
 def read_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -850,6 +883,7 @@ def evaluate_gamma(
             total_time = 0.0
             length_capped = 0
             repetition_artifacts = 0
+            corruption_artifacts = 0
             details: list[dict[str, Any]] = []
 
             desc = f"gamma={gamma:.6g}"
@@ -910,6 +944,7 @@ def evaluate_gamma(
                 ):
                     is_length_capped = token_count >= args.max_new_tokens
                     repetition_artifact = has_repetition_artifact(gen)
+                    corruption_artifact = has_obvious_corruption_artifact(gen)
                     pred, is_correct = parse_prediction(
                         gen,
                         gt,
@@ -920,6 +955,7 @@ def evaluate_gamma(
                     total_tokens += token_count
                     length_capped += int(is_length_capped)
                     repetition_artifacts += int(repetition_artifact)
+                    corruption_artifacts += int(corruption_artifact)
 
                     if args.save_failures and not is_correct:
                         failure_cases.append(
@@ -945,6 +981,7 @@ def evaluate_gamma(
                                 "tokens": token_count,
                                 "length_capped": is_length_capped,
                                 "repetition_artifact": repetition_artifact,
+                                "corruption_artifact": corruption_artifact,
                             }
                         )
 
@@ -966,6 +1003,7 @@ def evaluate_gamma(
                     "avg_time_sec": total_time / total,
                     "length_capped_rate": length_capped / total,
                     "repetition_artifact_rate": repetition_artifacts / total,
+                    "corruption_artifact_rate": corruption_artifacts / total,
                 }
             )
             last_details = details
@@ -978,6 +1016,7 @@ def evaluate_gamma(
     avg_times = [row["avg_time_sec"] for row in run_metrics]
     length_capped_rates = [row["length_capped_rate"] for row in run_metrics]
     repetition_artifact_rates = [row["repetition_artifact_rate"] for row in run_metrics]
+    corruption_artifact_rates = [row["corruption_artifact_rate"] for row in run_metrics]
     correct_mean = int(round(float(np.mean([row["correct"] for row in run_metrics]))))
 
     return {
@@ -989,6 +1028,7 @@ def evaluate_gamma(
         "avg_time_sec": float(np.mean(avg_times)),
         "length_capped_rate": float(np.mean(length_capped_rates)),
         "repetition_artifact_rate": float(np.mean(repetition_artifact_rates)),
+        "corruption_artifact_rate": float(np.mean(corruption_artifact_rates)),
         "accuracy_std": float(np.std(accuracies)) if len(accuracies) > 1 else 0.0,
         "run_metrics": run_metrics,
         "detailed_results": last_details,
@@ -1531,6 +1571,7 @@ def main() -> None:
                 "avg_time_per_sample": row["avg_time_sec"],
                 "length_capped_rate": row["length_capped_rate"],
                 "repetition_artifact_rate": row["repetition_artifact_rate"],
+                "corruption_artifact_rate": row["corruption_artifact_rate"],
                 "max_new_tokens": args.max_new_tokens,
             }
 
@@ -1563,7 +1604,8 @@ def main() -> None:
             print(
                 f"  gamma={gamma:.6g}: acc={row['accuracy']:.4f}, "
                 f"tokens={row['avg_tokens']:.1f}, time={row['avg_time_sec']:.2f}s, "
-                f"repeat={row['repetition_artifact_rate']:.2%}"
+                f"repeat={row['repetition_artifact_rate']:.2%}, "
+                f"corrupt={row['corruption_artifact_rate']:.2%}"
             )
             print(f"    saved: {gamma_path}")
 
@@ -1606,7 +1648,8 @@ def main() -> None:
             f"  gamma={row['gamma']:.6g} | acc={row['accuracy']:.4f} "
             f"({row['correct']}/{row['total']}) | tokens={row['avg_tokens']:.1f} "
             f"| time={row['avg_time_sec']:.2f}s "
-            f"| repeat={row['repetition_artifact_rate']:.2%}"
+            f"| repeat={row['repetition_artifact_rate']:.2%} "
+            f"| corrupt={row['corruption_artifact_rate']:.2%}"
         )
     if stopped_early:
         print(f"  stopped early:  {stop_reason}")
