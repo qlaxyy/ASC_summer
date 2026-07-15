@@ -9,7 +9,6 @@ show held-out compression without unacceptable quality regressions.
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import time
 from pathlib import Path
@@ -135,15 +134,23 @@ def parse_args() -> argparse.Namespace:
         "--model_name",
         default="/root/autodl-tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     )
-    parser.add_argument(
-        "--local_data_path", default="datasets/gsm8k/train.jsonl"
-    )
+    parser.add_argument("--local_data_path", default="datasets/gsm8k/train.jsonl")
     parser.add_argument("--vector_dir", required=True)
     parser.add_argument("--file_prefix", required=True)
     parser.add_argument("--layer_indices", default="16,20,24")
     parser.add_argument("--candidate_gammas", default="0.5,1.0")
     parser.add_argument("--validation_samples", type=int, default=30)
     parser.add_argument("--validation_seed", type=int, default=314159)
+    parser.add_argument(
+        "--injection_scope",
+        choices=["sequence_all", "all_tokens"],
+        default="sequence_all",
+        help=(
+            "sequence_all steers every prompt/generation position. all_tokens "
+            "uses the evaluator's legacy name for final-prompt plus generation "
+            "positions, which is appropriate for response-trajectory vectors."
+        ),
+    )
     parser.add_argument("--min_compression", type=float, default=0.05)
     parser.add_argument("--max_accuracy_drop", type=float, default=0.04)
     parser.add_argument("--max_repetition_increase", type=float, default=0.04)
@@ -245,7 +252,7 @@ def main() -> None:
             str(vector_path),
             injection_sign="add",
             injection_site="block_output",
-            injection_scope="sequence_all",
+            injection_scope=args.injection_scope,
             injection_token_count=1,
             vector_normalization="unit_l2",
             intervention_mode="additive",
@@ -257,7 +264,11 @@ def main() -> None:
                 f"Candidate metadata is required: {vector_path}.metadata.json"
             )
         direction = str(metadata.get("direction", ""))
-        if "target_minus_source" not in direction:
+        direction_semantics = metadata.get("direction_semantics")
+        if (
+            "target_minus_source" not in direction
+            and direction_semantics != "target_minus_source"
+        ):
             raise ValueError(
                 f"{vector_path} is not declared target-minus-source: {direction!r}"
             )
@@ -268,7 +279,11 @@ def main() -> None:
             raise ValueError(
                 f"Layer mismatch for {vector_path}: metadata says {metadata_layer}."
             )
-        excluded_indices.update(int(index) for index in metadata["selected_row_indices"])
+        validation_exclusions = metadata.get(
+            "causal_validation_exclusion_indices",
+            metadata["selected_row_indices"],
+        )
+        excluded_indices.update(int(index) for index in validation_exclusions)
         source_row_counts.add(int(metadata["source_row_count"]))
         candidate_specs.append(
             {
@@ -306,7 +321,6 @@ def main() -> None:
     args.save_failures = False
     args.injection_sign = "add"
     args.injection_site = "block_output"
-    args.injection_scope = "sequence_all"
     args.injection_token_count = 1
     args.vector_normalization = "unit_l2"
     args.intervention_mode = "additive"
@@ -319,7 +333,7 @@ def main() -> None:
 
     print("Causal conciseness-vector selection")
     print(f"  held-out source: {args.local_data_path}")
-    print(f"  extraction rows excluded: {len(excluded_indices)}")
+    print(f"  train rows excluded from validation: {len(excluded_indices)}")
     print(f"  validation samples: {len(samples)}")
     print(f"  layers: {layers}")
     print(f"  positive gammas: {gammas}")
@@ -328,7 +342,7 @@ def main() -> None:
         f"paper_cot, temperature={args.temperature}, top_p={args.top_p}, "
         f"repetition_penalty={args.repetition_penalty}"
     )
-    print("  intervention: block_output / sequence_all / positive additive")
+    print(f"  intervention: block_output / {args.injection_scope} / positive additive")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -360,13 +374,17 @@ def main() -> None:
     report: dict[str, Any] = {
         "status": "running",
         "method": "held_out_causal_layer_and_positive_gamma_selection",
-        "invariant": "v=concise_target-source; h<-h+gamma*v; gamma>0",
+        "invariant": (
+            "v=concise_target-source; h<-h+gamma*v; gamma>0; "
+            f"scope={args.injection_scope}"
+        ),
         "model_name": args.model_name,
         "data": {
             "dataset": "gsm8k_train_validation",
             "path": args.local_data_path,
             "row_count": len(rows),
             "extraction_indices_excluded": sorted(excluded_indices),
+            "validation_exclusion_indices": sorted(excluded_indices),
             "validation_indices": validation_indices,
             "validation_seed": args.validation_seed,
         },
@@ -476,7 +494,7 @@ def main() -> None:
         "recommended_positive_gamma": selected["gamma"],
         "recommended_injection_sign": "add",
         "matching_injection_site": "block_output",
-        "recommended_injection_scope": "sequence_all",
+        "recommended_injection_scope": args.injection_scope,
         "recommended_injection_token_count": 1,
         "recommended_vector_normalization": "unit_l2",
         "recommended_intervention_mode": "additive",
@@ -484,6 +502,7 @@ def main() -> None:
         "causal_validation_dataset": "gsm8k_train_validation",
         "causal_validation_indices": validation_indices,
         "causal_validation_excluded_extraction_indices": sorted(excluded_indices),
+        "causal_validation_exclusion_indices": sorted(excluded_indices),
         "causal_selection_criteria": criteria,
         "causal_baseline": compact_metrics(baseline),
         "causal_selected_metrics": selected_summary,
