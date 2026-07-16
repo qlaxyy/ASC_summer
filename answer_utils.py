@@ -53,6 +53,13 @@ def strip_string(value: Any) -> str:
     string = _fix_fracs(string)
     string = _fix_a_slash_b(string)
     string = string.replace(" ", "")
+    string = re.sub(
+        r"^(?:approximately|approx(?:imately)?|about|around|roughly|"
+        r"\\approx|[~≈])",
+        "",
+        string,
+        flags=re.IGNORECASE,
+    )
     string = re.sub(r"(\\|,|\.)+$", "", string)
     return string
 
@@ -200,7 +207,7 @@ def _extract_marked_numbers(text: str) -> list[str]:
     )
     candidates = []
     for match in marker_pat.finditer(text):
-        segment = text[match.end():][:500]
+        segment = text[match.end() :][:500]
         if not segment.strip():
             continue
 
@@ -253,7 +260,7 @@ def _extract_program_output(text: str) -> str:
 
 
 def _tail_candidate(text: str) -> str:
-    tail = text[int(len(text) * 0.6):]
+    tail = text[int(len(text) * 0.6) :]
 
     final_phrase = _extract_tail_final_candidate(tail)
     if not final_phrase:
@@ -266,8 +273,13 @@ def _tail_candidate(text: str) -> str:
         return list_candidate
 
     frac_eq_matches = re.findall(
-        r"=\s*(" + _latex_frac_pattern() + r"|" + _plain_frac_pattern() + r"|"
-        + _complex_pattern() + r")",
+        r"=\s*("
+        + _latex_frac_pattern()
+        + r"|"
+        + _plain_frac_pattern()
+        + r"|"
+        + _complex_pattern()
+        + r")",
         tail,
     )
     if frac_eq_matches:
@@ -392,7 +404,7 @@ def extract_all_answers(pred_str: str) -> list[str]:
     boxed = [ans for ans in boxed if ans and _is_plausible_answer(ans)]
     if boxed:
         if any(re.fullmatch(r"[A-Z]", ans) for ans in boxed):
-            named = _extract_tail_final_candidate(text[int(len(text) * 0.5):])
+            named = _extract_tail_final_candidate(text[int(len(text) * 0.5) :])
             if named and named not in boxed:
                 return boxed + [named]
         return boxed
@@ -577,6 +589,10 @@ def compare_answers(pred: Any, gt: Any, prec: float = 1e-3) -> bool:
     return _sympy_equal(pred_s, gt_s, prec=prec)
 
 
-def is_correct(item: dict[str, Any], pred_key: str = "prediction", prec: float = 1e-3) -> bool:
+def is_correct(
+    item: dict[str, Any], pred_key: str = "prediction", prec: float = 1e-3
+) -> bool:
     copied = deepcopy(item)
-    return compare_answers(copied.get(pred_key, ""), copied.get("answer", ""), prec=prec)
+    return compare_answers(
+        copied.get(pred_key, ""), copied.get("answer", ""), prec=prec
+    )

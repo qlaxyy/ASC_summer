@@ -1,5 +1,6 @@
 import unittest
 
+from answer_utils import compare_answers
 from answer_utils import extract_answer
 
 
@@ -18,6 +19,14 @@ class FinalAnswerMarkdownTests(unittest.TestCase):
         Kylar pays **\$64** for all 16 glasses.
         """
         self.assertEqual(extract_answer(output), "64")
+
+    def test_accepts_qualified_number_inside_boxed_text(self) -> None:
+        output = r"""
+        \[
+        \boxed{\text{Approximately }95\text{ minutes}}
+        \]
+        """
+        self.assertTrue(compare_answers(extract_answer(output), "95"))
 
 
 if __name__ == "__main__":
