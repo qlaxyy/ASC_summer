@@ -19,6 +19,9 @@ Token compression = (CoT avg tokens - ASC avg tokens) / CoT avg tokens
   91%，bootstrap 95% 区间跨过 0。
 - 在两个新的 GSM8K train validation split 上，长度延迟门控与隐藏状态条件门控
   均为 `null_result`；门控实际触发但没有稳健压缩。
+- 理论方向一致的 raw-prompt endpoint 向量也未通过20题生存测试：正向
+  `gamma=0.27` 将平均长度从733.4轻微增加到736.2，准确率均为16/20，且无
+  复读、乱码或答案复核样本。raw prompt 没有救活正向单向量。
 - 因此不能继续声称该自提取向量在 DeepSeek-R1-Distill-Qwen-7B 上“稳定压缩”。
   Qwen3、MATH 和作者向量结果尚未按同等协议复核，当前保留为待审计信号。
 

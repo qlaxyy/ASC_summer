@@ -100,3 +100,25 @@ python eval_asc_paper.py \
 - 若正向 gamma 增加 token、产生乱码/复读或明显降准确率，停止该路线；
 - 若压缩达到约 10% 且准确率不下降超过 1/20，再用新的开发切片复验；
 - 不因失败改成负 gamma，因为那会重新回到理论与工程不一致的问题。
+
+## 实际结果与终止结论
+
+20 道 GSM8K 低成本生存测试得到：
+
+| gamma | Accuracy | Avg tokens | 相对 gamma=0 | Repeat | Corrupt | Answer review |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 16/20 (80%) | 733.4 | baseline | 0% | 0% | 0% |
+| +0.27 | 16/20 (80%) | 736.2 | -0.38% compression（即增长） | 0% | 0% | 0% |
+
+正向干预只增加约 2.8 个 token，准确率和异常指标不变。这不是有效压缩，也不是答案解析、
+乱码或复读造成的假象。该路线记为 `null_result`，不继续搜索更大 gamma、负 gamma 或其他
+test 切片。
+
+提示模式冻结为：
+
+- `raw`：作者 README/公开 `generate.py` 对齐的主要工程复现提示模式；
+- `paper_cot`：保留为论文文字中“standard CoT prompting”的历史扩展对照；
+- 不跨提示模式共用 baseline 或拼接结果；
+- 作者向量在 raw+subtract 下的压缩只能报告为理论符号冲突的工程复现信号；
+- raw 自提取 short-minus-long 向量的正向结果为零，说明改成 raw prompt 没有救活理论一致的
+  单一 endpoint mean vector。
