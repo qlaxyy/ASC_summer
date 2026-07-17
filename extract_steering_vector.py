@@ -58,13 +58,16 @@ def parse_args() -> argparse.Namespace:
         "--vector_method",
         choices=[
             "asc_endpoint",
+            "asc_endpoint_raw",
             "actadd_prompt",
             "actadd_prompt_aligned",
             "actadd_prompt_paper_aligned",
         ],
         default="asc_endpoint",
         help=(
-            "asc_endpoint compares the ends of complete short/long answers. "
+            "asc_endpoint compares complete short/long answers after the saved "
+            "long_prompt. asc_endpoint_raw instead uses the unchanged raw problem "
+            "as the shared prefix, matching README-style raw inference. "
             "actadd_prompt constructs matched concise/step-by-step prompts from "
             "each problem. actadd_prompt_aligned places the style instruction "
             "before a shared question suffix and pools shared question tokens. "
@@ -142,13 +145,31 @@ def main() -> None:
     if not source_path.exists():
         raise FileNotFoundError(f"Input file not found: {source_path}")
 
-    pairs = (
+    source_payload = (
         utils.read_jsonl(source_path)
         if source_path.suffix.lower() == ".jsonl"
         else utils.read_json(source_path)
     )
+    source_manifest = None
+    source_container_row_count = None
+    if isinstance(source_payload, dict) and isinstance(source_payload.get("pairs"), list):
+        source_manifest = source_payload
+        container_pairs = source_payload["pairs"]
+        source_container_row_count = len(container_pairs)
+        has_selection_flags = any(
+            "selected_for_extraction" in row for row in container_pairs
+        )
+        pairs = (
+            [row for row in container_pairs if row.get("selected_for_extraction")]
+            if has_selection_flags
+            else container_pairs
+        )
+    else:
+        pairs = source_payload
     if not isinstance(pairs, list) or not pairs:
-        raise ValueError("The input path must contain non-empty problem rows.")
+        raise ValueError(
+            "The input path must contain a non-empty row list or a report with pairs[]."
+        )
     source_row_count = len(pairs)
     selected_indices = list(range(source_row_count))
     if 0 < args.num_samples < source_row_count:
@@ -161,8 +182,13 @@ def main() -> None:
     is_aligned = args.vector_method == "actadd_prompt_aligned"
     is_paper_aligned = args.vector_method == "actadd_prompt_paper_aligned"
     has_shared_suffix = is_aligned or is_paper_aligned
-    if args.vector_method == "asc_endpoint" and args.pairs_path is None:
-        raise ValueError("asc_endpoint requires --pairs_path with checked CoT pairs.")
+    if (
+        args.vector_method in {"asc_endpoint", "asc_endpoint_raw"}
+        and args.pairs_path is None
+    ):
+        raise ValueError(
+            f"{args.vector_method} requires --pairs_path with checked CoT pairs."
+        )
     if has_shared_suffix and args.problems_path is None:
         raise ValueError(
             "Aligned ActAdd prompt methods require --problems_path so their "
@@ -219,6 +245,7 @@ def main() -> None:
     print(f"  pooled tokens:{args.pool_last_n_tokens}")
     if shared_suffix_agreement is not None:
         print(f"  suffix match:{shared_suffix_agreement:.2%}")
+    is_raw_endpoint = args.vector_method == "asc_endpoint_raw"
     if is_paper_aligned:
         text_mode = "concise prefix vs unchanged paper_cot with shared suffix"
         metadata_text_mode = "concise_prefix_vs_unchanged_paper_cot_shared_suffix"
@@ -237,6 +264,12 @@ def main() -> None:
         positive_text = "matched_concise_prompt"
         negative_text = "paper_cot_prompt"
         matching_prompt_mode = "paper_cot"
+    elif is_raw_endpoint:
+        text_mode = "raw problem + short/long cot"
+        metadata_text_mode = "raw_problem+cot_last_token"
+        positive_text = "raw_problem+short_cot"
+        negative_text = "raw_problem+long_cot"
+        matching_prompt_mode = "raw"
     else:
         text_mode = "long_prompt + short/long cot"
         metadata_text_mode = "long_prompt+cot_last_token"
@@ -293,6 +326,7 @@ def main() -> None:
         "recommended_injection_token_count": (
             args.pool_last_n_tokens if is_actadd else 1
         ),
+        "recommended_vector_normalization": "none",
         "formula": (
             "v = h(short) - h(long); h <- h + gamma*v"
             if args.direction == "short_minus_long"
@@ -302,7 +336,13 @@ def main() -> None:
             "v_i = mean_last_N(h_pre_L(P_short(q_i))) - "
             "mean_last_N(h_pre_L(P_long(q_i)))"
             if is_actadd
-            else "v_i = h_L(long_prompt+short_cot)[-1] - h_L(long_prompt+long_cot)[-1]"
+            else (
+                "v_i = h_L(raw_problem+short_cot)[-1] - "
+                "h_L(raw_problem+long_cot)[-1]"
+                if is_raw_endpoint
+                else "v_i = h_L(long_prompt+short_cot)[-1] - "
+                "h_L(long_prompt+long_cot)[-1]"
+            )
         ),
         "injection_formula": (
             "h_pre_L(P_long(q))[-N:] <- h_pre_L(P_long(q))[-N:] + gamma*mean(v_i)"
@@ -325,7 +365,7 @@ def main() -> None:
         ),
         "matching_prompt_mode": matching_prompt_mode,
         "paper_cot_baseline_unchanged": is_paper_aligned,
-        "positive_gamma_only": is_actadd,
+        "positive_gamma_only": is_actadd or is_raw_endpoint,
         "pool_last_n_tokens": args.pool_last_n_tokens,
         "shared_suffix_token_agreement": shared_suffix_agreement,
         "num_vectors": int(vectors.shape[0]),
@@ -343,6 +383,15 @@ def main() -> None:
         ),
         "source_path": str(source_path),
         "source_row_count": source_row_count,
+        "source_container_row_count": source_container_row_count,
+        "source_manifest_method": (
+            source_manifest.get("method") if source_manifest is not None else None
+        ),
+        "source_pair_row_indices": [
+            row.get("source_row_index")
+            for row in pairs
+            if row.get("source_row_index") is not None
+        ],
         "selected_row_indices": selected_indices,
         "sample_selection": (
             "seeded_random_without_replacement"

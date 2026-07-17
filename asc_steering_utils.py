@@ -633,12 +633,14 @@ def normalize_pair(row: dict[str, Any]) -> tuple[str, str, str]:
         row.get("short_cot")
         or row.get("short_answer")
         or row.get("concise_cot")
+        or row.get("concise_output")
         or row.get("answer_short")
     )
     long = (
         row.get("long_cot")
         or row.get("long_answer")
         or row.get("verbose_cot")
+        or row.get("verbose_output")
         or row.get("answer_long")
     )
     if short is None and "answer" in row and "long_cot" not in row:
@@ -693,10 +695,16 @@ def pair_texts_for_activation(
         "actadd_prompt_paper_aligned",
     }:
         return pair_prompts_for_activation(row, vector_method)
-    if vector_method != "asc_endpoint":
+    if vector_method not in {"asc_endpoint", "asc_endpoint_raw"}:
         raise ValueError(f"Unknown vector_method: {vector_method}")
 
-    _problem, short_cot, long_cot = normalize_pair(row)
+    problem, short_cot, long_cot = normalize_pair(row)
+    if vector_method == "asc_endpoint_raw":
+        return (
+            append_cot_to_prompt(problem, short_cot),
+            append_cot_to_prompt(problem, long_cot),
+        )
+
     long_prompt = row.get("long_prompt")
     if not long_prompt:
         raise ValueError(
