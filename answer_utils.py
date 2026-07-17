@@ -12,6 +12,9 @@ from copy import deepcopy
 from typing import Any
 
 
+ANSWER_PARSER_VERSION = "2.0.1"
+
+
 # ---------------------------------------------------------------------------
 # Normalisation
 # ---------------------------------------------------------------------------
@@ -259,18 +262,18 @@ def _extract_program_output(text: str) -> str:
     return _clean_candidate(out)
 
 
-def _tail_candidate(text: str) -> str:
+def _tail_candidate_with_trace(text: str) -> tuple[str, str, str, list[str]]:
     tail = text[int(len(text) * 0.6) :]
 
     final_phrase = _extract_tail_final_candidate(tail)
     if not final_phrase:
         final_phrase = _extract_tail_final_candidate(text)
     if final_phrase:
-        return final_phrase
+        return final_phrase, "final_phrase", "high", []
 
     list_candidate = _extract_tail_list_candidate(tail)
     if list_candidate:
-        return list_candidate
+        return list_candidate, "final_answer_list", "high", []
 
     frac_eq_matches = re.findall(
         r"=\s*("
@@ -283,14 +286,14 @@ def _tail_candidate(text: str) -> str:
         tail,
     )
     if frac_eq_matches:
-        return _clean_candidate(frac_eq_matches[-1])
+        return _clean_candidate(frac_eq_matches[-1]), "tail_equation", "medium", []
 
     eq_matches = re.findall(
         r"=\s*(" + _number_pattern() + r")\s*(?:$|\.|\n|,|\]|\)|\s)",
         tail,
     )
     if eq_matches:
-        return _clean_candidate(eq_matches[-1])
+        return _clean_candidate(eq_matches[-1]), "tail_equation", "medium", []
 
     conclusion = re.findall(
         r"(?:therefore|so|hence|thus|finally)\s*,?\s*(.+?)(?:\n|$|\.\s*)",
@@ -300,18 +303,39 @@ def _tail_candidate(text: str) -> str:
     if conclusion:
         nums = _find_numbers(conclusion[-1])
         if nums:
-            return _clean_candidate(nums[-1])
+            return _clean_candidate(nums[-1]), "conclusion_number", "medium", []
 
     nums = _find_numbers(tail)
     if nums:
         front_nums = set(_find_numbers(text[: int(len(text) * 0.5)]))
         for num in reversed(nums):
             if num not in front_nums:
-                return _clean_candidate(num)
-        return _clean_candidate(nums[-1])
+                return (
+                    _clean_candidate(num),
+                    "tail_novel_number",
+                    "low",
+                    ["no_explicit_final_answer", "heuristic_numeric_fallback"],
+                )
+        return (
+            _clean_candidate(nums[-1]),
+            "tail_last_number",
+            "low",
+            ["no_explicit_final_answer", "heuristic_numeric_fallback"],
+        )
 
     nums = _find_numbers(text)
-    return _clean_candidate(nums[-1]) if nums else ""
+    if nums:
+        return (
+            _clean_candidate(nums[-1]),
+            "full_text_last_number",
+            "low",
+            ["no_explicit_final_answer", "heuristic_numeric_fallback"],
+        )
+    return "", "none", "none", ["no_answer_candidate"]
+
+
+def _tail_candidate(text: str) -> str:
+    return _tail_candidate_with_trace(text)[0]
 
 
 def _extract_tail_final_candidate(text: str) -> str:
@@ -393,9 +417,60 @@ def _extract_tail_list_candidate(text: str) -> str:
     return ""
 
 
-def extract_all_answers(pred_str: str) -> list[str]:
+def _dedupe_answers(answers: list[str]) -> list[str]:
+    seen: set[str] = set()
+    return [answer for answer in answers if not (answer in seen or seen.add(answer))]
+
+
+def _answer_trace(
+    *,
+    answer: str,
+    candidates: list[str],
+    source: str,
+    confidence: str,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    candidates = _dedupe_answers([candidate for candidate in candidates if candidate])
+    warnings = list(dict.fromkeys(warnings or []))
+    if len(candidates) > 1:
+        warnings.append("multiple_distinct_answer_candidates")
+    warnings = list(dict.fromkeys(warnings))
+    return {
+        "parser_version": ANSWER_PARSER_VERSION,
+        "answer": answer,
+        "candidates": candidates,
+        "source": source,
+        "confidence": confidence,
+        "selection_policy": (
+            "last_explicit_candidate"
+            if source in {"boxed", "marked_final_answer"}
+            else "single_selected_candidate"
+        ),
+        # Multiple explicit mentions are common in step-by-step answers. The
+        # last explicit candidate remains deterministic and is recorded above;
+        # only heuristic/absent extraction or a boxed/name conflict requires
+        # routine human review.
+        "requires_review": confidence in {"low", "none"}
+        or source == "boxed_then_named_conclusion",
+        "warnings": warnings,
+    }
+
+
+def extract_answer_with_trace(pred_str: str) -> dict[str, Any]:
+    """Extract the final answer and preserve auditable extraction provenance.
+
+    Explicit boxed/marked answers take priority. Numeric tail guessing is retained
+    for backwards compatibility, but is labelled low-confidence so that archived
+    evaluations can put only those samples into a manual-review queue.
+    """
     if not pred_str or not str(pred_str).strip():
-        return []
+        return _answer_trace(
+            answer="",
+            candidates=[],
+            source="none",
+            confidence="none",
+            warnings=["empty_generation", "no_answer_candidate"],
+        )
 
     text = str(pred_str).strip()
     text = re.sub(r"<\|?\|?think\|?>", "", text, flags=re.IGNORECASE)
@@ -406,35 +481,77 @@ def extract_all_answers(pred_str: str) -> list[str]:
         if any(re.fullmatch(r"[A-Z]", ans) for ans in boxed):
             named = _extract_tail_final_candidate(text[int(len(text) * 0.5) :])
             if named and named not in boxed:
-                return boxed + [named]
-        return boxed
+                return _answer_trace(
+                    answer=named,
+                    candidates=boxed + [named],
+                    source="boxed_then_named_conclusion",
+                    confidence="medium",
+                    warnings=["boxed_choice_overridden_by_named_conclusion"],
+                )
+        return _answer_trace(
+            answer=boxed[-1],
+            candidates=boxed,
+            source="boxed",
+            confidence="high",
+        )
 
     marked = _extract_marked_numbers(text)
     if marked:
-        return marked
+        return _answer_trace(
+            answer=marked[-1],
+            candidates=marked,
+            source="marked_final_answer",
+            confidence="high",
+        )
 
     program_output = _extract_program_output(text)
     if program_output:
-        return [program_output]
+        return _answer_trace(
+            answer=program_output,
+            candidates=[program_output],
+            source="program_output",
+            confidence="high",
+        )
 
     # If a model restarts after </think>, prefer the post-think section.
-    sections = [text]
+    sections = [("full_text", text)]
     if "</think>" in text:
         before, after = text.split("</think>", 1)
-        sections = [after.strip(), before.strip(), text]
+        sections = [
+            ("post_think", after.strip()),
+            ("pre_think", before.strip()),
+            ("full_text", text),
+        ]
 
-    for section in sections:
+    for section_name, section in sections:
         if not section:
             continue
-        candidate = _tail_candidate(section)
+        candidate, source, confidence, warnings = _tail_candidate_with_trace(section)
         if candidate:
-            return [candidate]
-    return []
+            if section_name != "full_text":
+                source = f"{section_name}_{source}"
+            return _answer_trace(
+                answer=candidate,
+                candidates=[candidate],
+                source=source,
+                confidence=confidence,
+                warnings=warnings,
+            )
+    return _answer_trace(
+        answer="",
+        candidates=[],
+        source="none",
+        confidence="none",
+        warnings=["no_answer_candidate"],
+    )
+
+
+def extract_all_answers(pred_str: str) -> list[str]:
+    return list(extract_answer_with_trace(pred_str)["candidates"])
 
 
 def extract_answer(pred_str: str) -> str:
-    answers = extract_all_answers(pred_str)
-    return answers[-1] if answers else ""
+    return str(extract_answer_with_trace(pred_str)["answer"])
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +697,10 @@ def compare_answers(pred: Any, gt: Any, prec: float = 1e-3) -> bool:
             return True
         if g_num != 0 and abs(p_num - g_num) / abs(g_num) < 1e-4:
             return True
+        # Both sides are already unambiguous scalars. Falling through to SymPy
+        # only adds optional antlr/gmpy dependencies and cannot make unequal
+        # scalar values symbolically equivalent.
+        return False
 
     p_norm = pred_s.lower().replace(" ", "").rstrip(".%")
     g_norm = gt_s.lower().replace(" ", "").rstrip(".%")
@@ -587,6 +708,17 @@ def compare_answers(pred: Any, gt: Any, prec: float = 1e-3) -> bool:
         return True
 
     return _sympy_equal(pred_s, gt_s, prec=prec)
+
+
+def evaluate_generation_answer(
+    generation: str,
+    gt: Any,
+    prec: float = 1e-3,
+) -> tuple[str, bool, dict[str, Any]]:
+    """Extract one final answer, compare it, and return the audit trace."""
+    trace = extract_answer_with_trace(generation)
+    pred = str(trace["answer"])
+    return pred, compare_answers(pred, gt, prec=prec), trace
 
 
 def is_correct(

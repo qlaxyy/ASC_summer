@@ -1,0 +1,22 @@
+{
+  "audit_schema_version": 2,
+  "answer_parser_version": "2.0.1",
+  "created_at_utc": "2026-07-17T12:10:12.087026+00:00",
+  "source": {
+    "path": "results/delayed_behavior_trajectory_trainval30.json",
+    "sha256": "8bb22a47be72fc2a515ad85942ddee95b1d2fa04122081cb9bbc02eda3acf0a2",
+    "bytes": 345480
+  },
+  "summary": {
+    "records": 120,
+    "old_correct": 116,
+    "new_correct": 116,
+    "prediction_changes": 0,
+    "judgment_changes": 0,
+    "review_queue_count": 0,
+    "confidence_counts": {
+      "high": 120
+    }
+  },
+  "review_queue": []
+}

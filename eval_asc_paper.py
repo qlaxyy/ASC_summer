@@ -45,8 +45,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from asc_steering_utils import ACTADD_ALIGNED_LONG_PROMPT_TEMPLATE
 from asc_steering_utils import ACTADD_LONG_PROMPT_TEMPLATE
 from answer_utils import compare_answers
-from answer_utils import extract_all_answers
-from answer_utils import extract_answer
+from answer_utils import evaluate_generation_answer
 from answer_utils import extract_ground_truth
 from loreft_utils import LoReFTBundle
 from loreft_utils import LoReFTHookController
@@ -195,27 +194,30 @@ def parse_prediction(
     dataset: str,
     use_our_eval: bool,
 ) -> tuple[str, bool]:
-    if use_our_eval:
-        pred = extract_answer(generation)
-        return pred, compare_answers(pred, gt)
+    pred, correct, _ = parse_prediction_with_trace(
+        generation,
+        gt,
+        dataset,
+        use_our_eval,
+    )
+    return pred, correct
 
-    preds = extract_all_answers(generation)
-    seen = set()
-    preds = [p for p in preds if not (p in seen or seen.add(p))]
-    if not preds:
-        return "", False
 
-    for pred in reversed(preds):
-        if compare_answers(pred, gt):
-            return pred, True
+def parse_prediction_with_trace(
+    generation: str,
+    gt: str,
+    dataset: str,
+    use_our_eval: bool,
+) -> tuple[str, bool, dict[str, Any]]:
+    """Select exactly one final answer and record why it was selected.
 
-    if dataset == "math" and len(preds) > 1:
-        pred = ",".join(sorted(preds))
-        gt_norm = ",".join(sorted([p.strip() for p in gt.split(",")]))
-    else:
-        pred = preds[-1]
-        gt_norm = gt
-    return pred, compare_answers(pred, gt_norm)
+    ``dataset`` and ``use_our_eval`` remain in the signature for command/API
+    compatibility. They no longer choose different scoring paths: accepting any
+    earlier candidate that happens to equal the ground truth can turn a final
+    wrong answer into a false positive.
+    """
+    del dataset, use_our_eval
+    return evaluate_generation_answer(generation, gt)
 
 
 def has_repetition_artifact(generation: str) -> bool:
@@ -1011,6 +1013,7 @@ def evaluate_gamma(
             length_capped = 0
             repetition_artifacts = 0
             corruption_artifacts = 0
+            answer_reviews_required = 0
             details: list[dict[str, Any]] = []
 
             desc = f"gamma={gamma:.6g}"
@@ -1073,17 +1076,23 @@ def evaluate_gamma(
                     is_length_capped = token_count >= args.max_new_tokens
                     repetition_artifact = has_repetition_artifact(gen)
                     corruption_artifact = has_obvious_corruption_artifact(gen)
-                    pred, is_correct = parse_prediction(
+                    pred, is_correct, answer_trace = parse_prediction_with_trace(
                         gen,
                         gt,
                         args.dataset,
                         args.use_our_eval,
+                    )
+                    answer_review_required = bool(
+                        answer_trace["requires_review"]
+                        or is_length_capped
+                        or corruption_artifact
                     )
                     correct += int(is_correct)
                     total_tokens += token_count
                     length_capped += int(is_length_capped)
                     repetition_artifacts += int(repetition_artifact)
                     corruption_artifacts += int(corruption_artifact)
+                    answer_reviews_required += int(answer_review_required)
 
                     if args.save_failures and not is_correct:
                         failure_cases.append(
@@ -1093,6 +1102,8 @@ def evaluate_gamma(
                                 "full_output": gen,
                                 "pred_answer": pred,
                                 "gt_answer": gt,
+                                "answer_extraction": answer_trace,
+                                "answer_review_required": answer_review_required,
                                 "gamma": float(gamma),
                                 "run": run_idx + 1,
                             }
@@ -1106,6 +1117,8 @@ def evaluate_gamma(
                                 "pred_answer": pred,
                                 "gt_answer": gt,
                                 "correct": is_correct,
+                                "answer_extraction": answer_trace,
+                                "answer_review_required": answer_review_required,
                                 "tokens": token_count,
                                 "length_capped": is_length_capped,
                                 "repetition_artifact": repetition_artifact,
@@ -1132,6 +1145,7 @@ def evaluate_gamma(
                     "length_capped_rate": length_capped / total,
                     "repetition_artifact_rate": repetition_artifacts / total,
                     "corruption_artifact_rate": corruption_artifacts / total,
+                    "answer_review_required_rate": answer_reviews_required / total,
                 }
             )
             last_details = details
@@ -1147,6 +1161,7 @@ def evaluate_gamma(
     length_capped_rates = [row["length_capped_rate"] for row in run_metrics]
     repetition_artifact_rates = [row["repetition_artifact_rate"] for row in run_metrics]
     corruption_artifact_rates = [row["corruption_artifact_rate"] for row in run_metrics]
+    answer_review_rates = [row["answer_review_required_rate"] for row in run_metrics]
     correct_mean = int(round(float(np.mean([row["correct"] for row in run_metrics]))))
 
     result = {
@@ -1159,6 +1174,7 @@ def evaluate_gamma(
         "length_capped_rate": float(np.mean(length_capped_rates)),
         "repetition_artifact_rate": float(np.mean(repetition_artifact_rates)),
         "corruption_artifact_rate": float(np.mean(corruption_artifact_rates)),
+        "answer_review_required_rate": float(np.mean(answer_review_rates)),
         "accuracy_std": float(np.std(accuracies)) if len(accuracies) > 1 else 0.0,
         "run_metrics": run_metrics,
         "detailed_results": last_details,
@@ -1430,7 +1446,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use_our_eval",
         action="store_true",
-        help="Compatibility flag; uses answer_utils.py either way.",
+        help=(
+            "Deprecated compatibility flag. Both settings now select and score "
+            "the same single final answer with answer_utils.py."
+        ),
     )
     parser.add_argument("--attn_impl", type=str, default="flash_attention_2")
     parser.add_argument(
@@ -1874,6 +1893,9 @@ def main() -> None:
                 "length_capped_rate": row["length_capped_rate"],
                 "repetition_artifact_rate": row["repetition_artifact_rate"],
                 "corruption_artifact_rate": row["corruption_artifact_rate"],
+                "answer_review_required_rate": row[
+                    "answer_review_required_rate"
+                ],
                 "max_new_tokens": args.max_new_tokens,
             }
 
@@ -1908,7 +1930,8 @@ def main() -> None:
                 f"  {parameter_name}={gamma:.6g}: acc={row['accuracy']:.4f}, "
                 f"tokens={row['avg_tokens']:.1f}, time={row['avg_time_sec']:.2f}s, "
                 f"repeat={row['repetition_artifact_rate']:.2%}, "
-                f"corrupt={row['corruption_artifact_rate']:.2%}"
+                f"corrupt={row['corruption_artifact_rate']:.2%}, "
+                f"answer_review={row['answer_review_required_rate']:.2%}"
             )
             print(f"    saved: {gamma_path}")
 
@@ -1953,7 +1976,8 @@ def main() -> None:
             f"({row['correct']}/{row['total']}) | tokens={row['avg_tokens']:.1f} "
             f"| time={row['avg_time_sec']:.2f}s "
             f"| repeat={row['repetition_artifact_rate']:.2%} "
-            f"| corrupt={row['corruption_artifact_rate']:.2%}"
+            f"| corrupt={row['corruption_artifact_rate']:.2%} "
+            f"| answer_review={row['answer_review_required_rate']:.2%}"
         )
     if uses_loreft:
         baseline = next(

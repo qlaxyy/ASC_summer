@@ -19,6 +19,9 @@ vectors/*.bin
 results/**/*.json
 results/*.json
 results/**/*.tmp
+# Small, content-addressed answer audits are reproducibility metadata.
+!results/answer_audits/
+!results/answer_audits/*.json
 *.tmp
 
 # Credentials and machine-specific configuration

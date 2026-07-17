@@ -1,0 +1,75 @@
+{
+  "audit_schema_version": 2,
+  "answer_parser_version": "2.0.1",
+  "created_at_utc": "2026-07-17T12:10:12.060573+00:00",
+  "source": {
+    "path": "prompt_control_paper_cot_verbose_prefix.json",
+    "sha256": "8d6c1a560a56a16bc3aea9d46a0d443af41e182cfedc747f757e855ef4f81dfb",
+    "bytes": 149677
+  },
+  "summary": {
+    "records": 30,
+    "old_correct": 25,
+    "new_correct": 26,
+    "prediction_changes": 1,
+    "judgment_changes": 1,
+    "review_queue_count": 2,
+    "confidence_counts": {
+      "high": 29,
+      "medium": 1
+    }
+  },
+  "review_queue": [
+    {
+      "record_path": "root.detailed_results[5]",
+      "question": "Reasoning instruction: Be extremely detailed.\nQuestion: Kylar went to the store to buy glasses for his new apartment. One glass costs $5, but every second glass costs only 60% of the price. Kylar wants to buy 16 glasses. How much does he need to pay for them?\nLet's think step by step.",
+      "old_pred_answer": "24",
+      "new_pred_answer": "64",
+      "gt_answer": "64",
+      "old_correct": false,
+      "new_correct": true,
+      "answer_extraction": {
+        "parser_version": "2.0.1",
+        "answer": "64",
+        "candidates": [
+          "64"
+        ],
+        "source": "post_think_final_phrase",
+        "confidence": "high",
+        "selection_policy": "single_selected_candidate",
+        "requires_review": false,
+        "warnings": []
+      },
+      "review_reasons": [
+        "prediction_changed_since_archive",
+        "judgment_changed_since_archive"
+      ],
+      "model_output_tail": "l of **\\$64** for 16 glasses.\n\n### Step-by-Step Explanation:\n\n1. **Determine Pricing Structure:**\n   - **Regular Price:** \\$5 per glass.\n   - **Discounted Price:** Every second glass is 60% of \\$5.\n     - Calculated as: \\( \\$5 \\times 0.6 = \\$3 \\).\n\n2. **Count the Glasses:**\n   - Total glasses needed: 16.\n   - Since every second glass is discounted, half of them will be at regular price, and half at discounted.\n     - Regular price glasses: \\( \\frac{16}{2} = 8 \\).\n     - Discounted glasses: \\( \\frac{16}{2} = 8 \\).\n\n3. **Calculate Costs:**\n   - **Regular Glasses Cost:** \n     - \\( 8 \\text{ glasses} \\times \\$5 = \\$40 \\).\n   - **Discounted Glasses Cost:**\n     - \\( 8 \\text{ glasses} \\times \\$3 = \\$24 \\).\n\n4. **Compute Total Cost:**\n   - Sum of regular and discounted costs:\n     - \\( \\$40 + \\$24 = \\$64 \\).\n\n### Conclusion:\nBy breaking down the problem into counting regular and discounted glasses, applying the respective prices, and summing the totals, Kylar pays **\\$64** for all 16 glasses."
+    },
+    {
+      "record_path": "root.detailed_results[7]",
+      "question": "Reasoning instruction: Be extremely detailed.\nQuestion: Carla is downloading a 200 GB file. Normally she can download 2 GB/minute, but 40% of the way through the download, Windows forces a restart to install updates, which takes 20 minutes. Then Carla has to restart the download from the beginning. How load does it take to download the file?\nLet's think step by step.",
+      "old_pred_answer": "140",
+      "new_pred_answer": "140",
+      "gt_answer": "160",
+      "old_correct": false,
+      "new_correct": false,
+      "answer_extraction": {
+        "parser_version": "2.0.1",
+        "answer": "140",
+        "candidates": [
+          "140"
+        ],
+        "source": "final_phrase",
+        "confidence": "high",
+        "selection_policy": "single_selected_candidate",
+        "requires_review": false,
+        "warnings": []
+      },
+      "review_reasons": [
+        "length_capped"
+      ],
+      "model_output_tail": "he download implies 40% of the total.\n\nHence, sticking with the initial interpretation, each time she downloads 80 GB, gets interrupted, etc., totaling 140 minutes.\n\nWait, but hold on. Let me compute the total time precisely:\n\n- First, she downloads 80 GB: 80 / 2 = 40 minutes.\n\n- Then, 20 minutes update.\n\n- Then, restarts. She downloads another 80 GB: 40 minutes.\n\n- Then, 20 minutes update.\n\n- Now, 40 GB left.\n\n- She downloads 40 GB: 20 minutes.\n\nNo update needed because 40 GB < 80 GB.\n\nTotal time: 40 + 20 + 40 + 20 + 20 = 140 minutes.\n\nYes, 140 minutes total.\n\nAlternatively, someone might argue that after the second restart, she has 40 GB left. Since 40 GB is 20% of 200 GB, which is less than 40%, so no update is needed. Hence, no additional 20 minutes.\n\nAnother perspective: Suppose she had continued past 80 GB in each cycle. But in reality, the update only happens when she reaches 40% of the total, i.e., 80 GB, so she can't proceed past that without an update.\n\nThus, after each 80 GB"
+    }
+  ]
+}

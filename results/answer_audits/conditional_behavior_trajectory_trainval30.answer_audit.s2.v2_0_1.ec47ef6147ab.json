@@ -1,0 +1,48 @@
+{
+  "audit_schema_version": 2,
+  "answer_parser_version": "2.0.1",
+  "created_at_utc": "2026-07-17T12:10:12.071786+00:00",
+  "source": {
+    "path": "results/conditional_behavior_trajectory_trainval30.json",
+    "sha256": "ec47ef6147abf565ed55c6d5e004c15b9a6dbde9f57dffd4d70536d395cd9174",
+    "bytes": 328127
+  },
+  "summary": {
+    "records": 120,
+    "old_correct": 117,
+    "new_correct": 117,
+    "prediction_changes": 0,
+    "judgment_changes": 0,
+    "review_queue_count": 1,
+    "confidence_counts": {
+      "high": 120
+    }
+  },
+  "review_queue": [
+    {
+      "record_path": "root.candidates[2].detailed_results[17]",
+      "question": "Question: Every year, Tabitha adds a new color to her hair.  She started this tradition when she was 15 years old, which was the year she added her second hair color.  In three years, Tabitha will have 8 different colors in the hair.  Currently, how old is Tabitha?\nLet's think step by step.",
+      "old_pred_answer": "18",
+      "new_pred_answer": "18",
+      "gt_answer": "18",
+      "old_correct": true,
+      "new_correct": true,
+      "answer_extraction": {
+        "parser_version": "2.0.1",
+        "answer": "18",
+        "candidates": [
+          "18"
+        ],
+        "source": "marked_final_answer",
+        "confidence": "high",
+        "selection_policy": "last_explicit_candidate",
+        "requires_review": false,
+        "warnings": []
+      },
+      "review_reasons": [
+        "length_capped"
+      ],
+      "model_output_tail": "of colors at age X is X –13, starting from 2 at 15.\n\nSo:\n\nAt 15:15 –13=2\n\nAt 16:16 –13=3\n\n...\n\nAt X: X –13\n\nIn three years: X+3 –13=(X –10)=8⇒X=18\n\nBut check:\n\nIf X=18 now, number of colors is18 –13=5\n\nIn three years,21 –13=8. Correct.\n\nBut then, the number of colors at 18 is 5, while according to the first model, it should be1 + (18 –15)=4.\n\nConflict arises because the two models differ in their base assumptions about how many colors she had before 15.\n\nModel 1 assumes she had 1 color before 15, Model 2 assumes she had 2 colors at 15.\n\nBut according to the problem statement: \"when she was 15 years old, which was the year she added her second hair color\"\n\nSo, she added her second color when she was 15, meaning that before 15, she had one color.\n\nThus, Model 1 is accurate: number of colors now=1 + (X –15)\n\nThus, X=19.\n\nBut in that case, in three years, she’d be 22, and number of colors=1 +7=8, which matches.\n\nBut in the Model 2, if we assume number of colors=2 + (X –15), leading to X=18"
+    }
+  ]
+}
