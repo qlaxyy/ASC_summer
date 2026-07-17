@@ -2,6 +2,8 @@ import unittest
 
 from select_causal_conciseness_vector import assess_candidate
 from select_causal_conciseness_vector import choose_held_out_rows
+from select_causal_conciseness_vector import interpolate_projection_threshold
+from select_causal_conciseness_vector import parse_projection_alpha_list
 from select_causal_conciseness_vector import select_best_candidate
 
 try:
@@ -37,6 +39,22 @@ class CausalVectorSelectionTests(unittest.TestCase):
         second = choose_held_out_rows(20, {0, 1, 2}, 5, 123)
         self.assertEqual(first, second)
         self.assertTrue(set(first).isdisjoint({0, 1, 2}))
+
+    def test_projection_alphas_are_bounded_and_deduplicated(self):
+        self.assertEqual(
+            parse_projection_alpha_list("0.25,0.5,0.25"),
+            [0.25, 0.5],
+        )
+        with self.assertRaisesRegex(ValueError, r"\[0, 1\]"):
+            parse_projection_alpha_list("1.1")
+
+    def test_projection_threshold_interpolates_from_verbose_to_concise(self):
+        self.assertAlmostEqual(
+            interpolate_projection_threshold(-112.0, -48.0, 0.25),
+            -96.0,
+        )
+        with self.assertRaisesRegex(ValueError, "must exceed"):
+            interpolate_projection_threshold(-48.0, -112.0, 0.5)
 
     def test_candidate_passes_all_hard_constraints(self):
         result = assess_candidate(

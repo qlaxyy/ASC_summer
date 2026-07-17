@@ -38,6 +38,33 @@ def parse_positive_float_list(text: str) -> list[float]:
     return list(dict.fromkeys(values))
 
 
+def parse_projection_alpha_list(text: str | None) -> list[float]:
+    if text is None:
+        return []
+    values = [float(part.strip()) for part in text.split(",") if part.strip()]
+    if not values:
+        raise ValueError("The projection-alpha list cannot be empty.")
+    if any(value < 0 or value > 1 for value in values):
+        raise ValueError("Projection alphas must be in [0, 1].")
+    return list(dict.fromkeys(values))
+
+
+def interpolate_projection_threshold(
+    verbose_mean: float,
+    concise_mean: float,
+    alpha: float,
+) -> float:
+    if not all(math.isfinite(value) for value in (verbose_mean, concise_mean, alpha)):
+        raise ValueError("Projection threshold inputs must be finite.")
+    if not 0 <= alpha <= 1:
+        raise ValueError("Projection alpha must be in [0, 1].")
+    if concise_mean <= verbose_mean:
+        raise ValueError(
+            "Concise projection mean must exceed verbose projection mean."
+        )
+    return verbose_mean + alpha * (concise_mean - verbose_mean)
+
+
 def choose_held_out_rows(
     row_count: int,
     excluded_indices: set[int],
@@ -203,6 +230,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer_indices", default="16,20,24")
     parser.add_argument("--candidate_gammas", default="0.5,1.0")
     parser.add_argument(
+        "--intervention_mode",
+        choices=["additive", "conditional_additive"],
+        default="additive",
+    )
+    parser.add_argument(
+        "--candidate_projection_alphas",
+        default=None,
+        help=(
+            "For conditional_additive, interpolate thresholds as "
+            "verbose_mean + alpha*(concise_mean-verbose_mean)."
+        ),
+    )
+    parser.add_argument(
         "--candidate_start_tokens",
         default="0",
         help=(
@@ -322,6 +362,23 @@ def main() -> None:
     layers = parse_int_list(args.layer_indices, "layer")
     gammas = parse_positive_float_list(args.candidate_gammas)
     start_tokens = parse_int_list(args.candidate_start_tokens, "start-token")
+    projection_alphas = parse_projection_alpha_list(
+        args.candidate_projection_alphas
+    )
+    if args.intervention_mode == "conditional_additive":
+        if not projection_alphas:
+            raise ValueError(
+                "conditional_additive requires --candidate_projection_alphas."
+            )
+        if args.injection_scope != "all_tokens":
+            raise ValueError(
+                "conditional_additive requires --injection_scope all_tokens."
+            )
+    elif projection_alphas:
+        raise ValueError(
+            "--candidate_projection_alphas requires "
+            "--intervention_mode conditional_additive."
+        )
     if any(value >= args.max_new_tokens for value in start_tokens):
         raise ValueError(
             "Every delayed start token must be smaller than --max_new_tokens."
@@ -351,7 +408,7 @@ def main() -> None:
             injection_scope=args.injection_scope,
             injection_token_count=1,
             vector_normalization="unit_l2",
-            intervention_mode="additive",
+            intervention_mode=args.intervention_mode,
             prompt_mode=args.prompt_mode,
             allow_mismatch=False,
         )
@@ -375,6 +432,21 @@ def main() -> None:
             raise ValueError(
                 f"Layer mismatch for {vector_path}: metadata says {metadata_layer}."
             )
+        if args.intervention_mode == "conditional_additive":
+            for key in ("concise_projection_mean", "verbose_projection_mean"):
+                value = metadata.get(key)
+                if value is None or not math.isfinite(float(value)):
+                    raise ValueError(
+                        f"Conditional intervention requires finite {key} in "
+                        f"{vector_path}.metadata.json"
+                    )
+            if float(metadata["concise_projection_mean"]) <= float(
+                metadata["verbose_projection_mean"]
+            ):
+                raise ValueError(
+                    "Conditional intervention expects concise projection mean "
+                    "to exceed verbose projection mean along target-minus-source."
+                )
         validation_exclusions = metadata.get(
             "causal_validation_exclusion_indices",
             metadata["selected_row_indices"],
@@ -420,7 +492,6 @@ def main() -> None:
     args.injection_token_count = 1
     args.injection_start_generated_token = 0
     args.vector_normalization = "unit_l2"
-    args.intervention_mode = "additive"
     args.resolved_projection_target = None
     args.resolved_device_map = resolve_device_map(args)
 
@@ -435,12 +506,17 @@ def main() -> None:
     print(f"  layers: {layers}")
     print(f"  positive gammas: {gammas}")
     print(f"  generated-token start candidates: {start_tokens}")
+    if projection_alphas:
+        print(f"  projection-alpha candidates: {projection_alphas}")
     print(
         "  generation protocol: "
         f"paper_cot, temperature={args.temperature}, top_p={args.top_p}, "
         f"repetition_penalty={args.repetition_penalty}"
     )
-    print(f"  intervention: block_output / {args.injection_scope} / positive additive")
+    print(
+        f"  intervention: block_output / {args.injection_scope} / "
+        f"positive {args.intervention_mode}"
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -474,10 +550,12 @@ def main() -> None:
     }
     report: dict[str, Any] = {
         "status": "running",
-        "method": "held_out_causal_layer_gamma_and_start_selection",
+        "method": "held_out_causal_intervention_selection",
         "invariant": (
             "v=concise_target-source; h<-h+gamma*v; gamma>0; "
-            f"scope={args.injection_scope}; delayed_start_candidates={start_tokens}"
+            f"scope={args.injection_scope}; mode={args.intervention_mode}; "
+            f"delayed_start_candidates={start_tokens}; "
+            f"projection_alphas={projection_alphas}"
         ),
         "model_name": args.model_name,
         "data": {
@@ -532,41 +610,69 @@ def main() -> None:
         if not torch.isfinite(vector_norm) or vector_norm <= 0:
             raise ValueError(f"Invalid vector norm for {spec['vector_path']}")
         vector = vector / vector_norm
-        for start_token in start_tokens:
-            args.injection_start_generated_token = start_token
-            for gamma in gammas:
-                print(
-                    f"[candidate] layer={spec['layer_index']}, gamma={gamma:.6g}, "
-                    f"start_after={start_token}"
+        alpha_candidates: list[float | None] = projection_alphas or [None]
+        for projection_alpha in alpha_candidates:
+            projection_threshold = None
+            if projection_alpha is not None:
+                verbose_mean = float(spec["metadata"]["verbose_projection_mean"])
+                concise_mean = float(spec["metadata"]["concise_projection_mean"])
+                projection_threshold = interpolate_projection_threshold(
+                    verbose_mean,
+                    concise_mean,
+                    projection_alpha,
                 )
-                metrics = evaluate_gamma(
-                    gamma=gamma,
-                    model=model,
-                    tokenizer=tokenizer,
-                    samples=samples,
-                    args=args,
-                    input_device=input_device,
-                    steering_vec_cpu=vector,
-                    layer_index=spec["layer_index"],
-                    paired_rng_states=paired_rng_states,
-                )
-                assessment = assess_candidate(baseline, metrics, **criteria)
-                candidate = {
-                    **metrics,
-                    **assessment,
-                    "layer_index": spec["layer_index"],
-                    "vector_path": spec["vector_path"],
-                    "injection_start_generated_token": start_token,
-                }
-                report["candidates"].append(candidate)
-                write_json_atomic(args.output_report, report)
-                verdict = "PASS" if candidate["eligible"] else "reject"
-                print(
-                    f"  {verdict}: acc={candidate['accuracy']:.4f}, "
-                    f"tokens={candidate['avg_tokens']:.1f}, "
-                    f"compression={candidate['compression_fraction']:.2%}, "
-                    f"reasons={candidate['rejection_reasons']}"
-                )
+            args.resolved_projection_target = projection_threshold
+            for start_token in start_tokens:
+                args.injection_start_generated_token = start_token
+                for gamma in gammas:
+                    label = (
+                        f"[candidate] layer={spec['layer_index']}, "
+                        f"gamma={gamma:.6g}, start_after={start_token}"
+                    )
+                    if projection_alpha is not None:
+                        label += (
+                            f", projection_alpha={projection_alpha:.3g}, "
+                            f"threshold={projection_threshold:.3f}"
+                        )
+                    print(label)
+                    metrics = evaluate_gamma(
+                        gamma=gamma,
+                        model=model,
+                        tokenizer=tokenizer,
+                        samples=samples,
+                        args=args,
+                        input_device=input_device,
+                        steering_vec_cpu=vector,
+                        layer_index=spec["layer_index"],
+                        paired_rng_states=paired_rng_states,
+                    )
+                    assessment = assess_candidate(baseline, metrics, **criteria)
+                    candidate = {
+                        **metrics,
+                        **assessment,
+                        "layer_index": spec["layer_index"],
+                        "vector_path": spec["vector_path"],
+                        "injection_start_generated_token": start_token,
+                        "intervention_mode": args.intervention_mode,
+                        "projection_alpha": projection_alpha,
+                        "projection_threshold": projection_threshold,
+                    }
+                    report["candidates"].append(candidate)
+                    write_json_atomic(args.output_report, report)
+                    verdict = "PASS" if candidate["eligible"] else "reject"
+                    gate_suffix = ""
+                    if candidate.get("conditional_gate"):
+                        gate_suffix = (
+                            ", gate="
+                            f"{candidate['conditional_gate']['steered_fraction']:.2%}"
+                        )
+                    print(
+                        f"  {verdict}: acc={candidate['accuracy']:.4f}, "
+                        f"tokens={candidate['avg_tokens']:.1f}, "
+                        f"compression={candidate['compression_fraction']:.2%}, "
+                        f"reasons={candidate['rejection_reasons']}"
+                        f"{gate_suffix}"
+                    )
 
     selected = select_best_candidate(report["candidates"])
     if selected is None:
@@ -607,12 +713,16 @@ def main() -> None:
             "injection_start_generated_token"
         ],
         "recommended_vector_normalization": "unit_l2",
-        "recommended_intervention_mode": "additive",
+        "recommended_intervention_mode": selected["intervention_mode"],
+        "recommended_projection_alpha": selected["projection_alpha"],
+        "recommended_projection_threshold": selected["projection_threshold"],
         "positive_gamma_only": True,
         "causal_validation_dataset": "gsm8k_train_validation",
         "causal_validation_indices": validation_indices,
         "causal_validation_excluded_extraction_indices": sorted(excluded_indices),
-        "causal_validation_exclusion_indices": sorted(excluded_indices),
+        "causal_validation_exclusion_indices": sorted(
+            excluded_indices.union(validation_indices)
+        ),
         "causal_selection_criteria": criteria,
         "causal_baseline": compact_metrics(baseline),
         "causal_selected_metrics": selected_summary,
@@ -629,6 +739,7 @@ def main() -> None:
     print(
         f"  layer={selected['layer_index']}, gamma={selected['gamma']:.6g}, "
         f"start_after={selected['injection_start_generated_token']}, "
+        f"mode={selected['intervention_mode']}, "
         f"compression={selected['compression_fraction']:.2%}, "
         f"accuracy_drop={selected['accuracy_drop']:.2%}"
     )

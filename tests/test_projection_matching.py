@@ -74,6 +74,28 @@ class ProjectionMatchingHookTests(unittest.TestCase):
                 intervention_mode="projection_match",
             )
 
+    def test_conditional_additive_only_steers_verbose_side(self) -> None:
+        hook = make_cached_output_steering_hook(
+            torch.tensor([1.0, 0.0]),
+            gamma=0.5,
+            injection_sign="add",
+            injection_scope="all_tokens",
+            injection_token_count=1,
+            intervention_mode="conditional_additive",
+            projection_target=0.0,
+        )
+
+        # Prompt prefill is outside the response-trajectory classifier domain.
+        prefill = torch.zeros(2, 3, 2)
+        self.assertIsNone(hook(None, None, (prefill,)))
+
+        hidden = torch.tensor([[[-1.0, 2.0]], [[1.0, 2.0]]])
+        output = hook(None, None, (hidden,))[0]
+        torch.testing.assert_close(
+            output,
+            torch.tensor([[[-0.5, 2.0]], [[1.0, 2.0]]]),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -413,7 +413,10 @@ def main() -> None:
             "recommended_injection_scope": "all_tokens",
             "recommended_injection_token_count": 1,
             "recommended_vector_normalization": "unit_l2",
-            "supported_intervention_modes": ["additive"],
+            "supported_intervention_modes": [
+                "additive",
+                "conditional_additive",
+            ],
             "recommended_intervention_mode": "additive",
             "matching_prompt_mode": "paper_cot",
             "positive_gamma_only": True,

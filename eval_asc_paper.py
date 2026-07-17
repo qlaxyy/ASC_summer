@@ -632,15 +632,33 @@ def make_cached_output_steering_hook(
             "Delayed steering is defined only for injection_scope='all_tokens'."
         )
     multiplier = 1.0 if injection_sign == "add" else -1.0
-    if intervention_mode not in {"additive", "projection_match"}:
+    if intervention_mode not in {
+        "additive",
+        "projection_match",
+        "conditional_additive",
+    }:
         raise ValueError(f"Unsupported intervention_mode: {intervention_mode}")
-    if intervention_mode == "projection_match" and projection_target is None:
-        raise ValueError("projection_match requires projection_target")
+    if intervention_mode in {"projection_match", "conditional_additive"}:
+        if projection_target is None:
+            raise ValueError(
+                f"{intervention_mode} requires projection_target"
+            )
+        if not math.isfinite(projection_target):
+            raise ValueError("projection_target must be finite")
+    if intervention_mode == "conditional_additive" and injection_scope != "all_tokens":
+        raise ValueError(
+            "conditional_additive is defined only for injection_scope='all_tokens'."
+        )
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
     state = {"generated_tokens_seen": 0}
+    gate_stats: dict[str, Any] = {"positions": 0, "mask_sums": []}
 
     def add_steer(_, __, output):
         hidden = output[0]
+        if intervention_mode == "conditional_additive" and hidden.shape[1] > 1:
+            # The behavior classifier was fitted on response trajectories, not prompts.
+            state["generated_tokens_seen"] = 0
+            return None
         if injection_start_generated_token:
             if hidden.shape[1] > 1:
                 # A new batched prefill resets the cached-generation counter.
@@ -663,12 +681,24 @@ def make_cached_output_steering_hook(
             cache[key] = steering_vec
         if intervention_mode == "additive":
             target[...] = target + multiplier * gamma * steering_vec
-        else:
+        elif intervention_mode == "projection_match":
             current_projection = (target * steering_vec).sum(dim=-1, keepdim=True)
             projection_delta = gamma * (projection_target - current_projection)
             target[...] = target + projection_delta * steering_vec
+        else:
+            current_projection = (target * steering_vec).sum(dim=-1, keepdim=True)
+            verbose_state = current_projection < projection_target
+            gate_stats["positions"] += verbose_state.numel()
+            gate_stats["mask_sums"].append(verbose_state.detach().sum())
+            target[...] = target + (
+                verbose_state.to(dtype=target.dtype)
+                * multiplier
+                * gamma
+                * steering_vec
+            )
         return (hidden, *output[1:])
 
+    add_steer.conditional_gate_stats = gate_stats  # type: ignore[attr-defined]
     return add_steer
 
 
@@ -693,15 +723,32 @@ def make_cached_input_steering_hook(
             "Delayed steering is defined only for injection_scope='all_tokens'."
         )
     multiplier = 1.0 if injection_sign == "add" else -1.0
-    if intervention_mode not in {"additive", "projection_match"}:
+    if intervention_mode not in {
+        "additive",
+        "projection_match",
+        "conditional_additive",
+    }:
         raise ValueError(f"Unsupported intervention_mode: {intervention_mode}")
-    if intervention_mode == "projection_match" and projection_target is None:
-        raise ValueError("projection_match requires projection_target")
+    if intervention_mode in {"projection_match", "conditional_additive"}:
+        if projection_target is None:
+            raise ValueError(
+                f"{intervention_mode} requires projection_target"
+            )
+        if not math.isfinite(projection_target):
+            raise ValueError("projection_target must be finite")
+    if intervention_mode == "conditional_additive" and injection_scope != "all_tokens":
+        raise ValueError(
+            "conditional_additive is defined only for injection_scope='all_tokens'."
+        )
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
     state = {"generated_tokens_seen": 0}
+    gate_stats: dict[str, Any] = {"positions": 0, "mask_sums": []}
 
     def add_steer(_module, inputs):
         hidden = inputs[0]
+        if intervention_mode == "conditional_additive" and hidden.shape[1] > 1:
+            state["generated_tokens_seen"] = 0
+            return None
         if injection_start_generated_token:
             if hidden.shape[1] > 1:
                 state["generated_tokens_seen"] = 0
@@ -723,12 +770,24 @@ def make_cached_input_steering_hook(
             cache[key] = steering_vec
         if intervention_mode == "additive":
             target[...] = target + multiplier * gamma * steering_vec
-        else:
+        elif intervention_mode == "projection_match":
             current_projection = (target * steering_vec).sum(dim=-1, keepdim=True)
             projection_delta = gamma * (projection_target - current_projection)
             target[...] = target + projection_delta * steering_vec
+        else:
+            current_projection = (target * steering_vec).sum(dim=-1, keepdim=True)
+            verbose_state = current_projection < projection_target
+            gate_stats["positions"] += verbose_state.numel()
+            gate_stats["mask_sums"].append(verbose_state.detach().sum())
+            target[...] = target + (
+                verbose_state.to(dtype=target.dtype)
+                * multiplier
+                * gamma
+                * steering_vec
+            )
         return (hidden, *inputs[1:])
 
+    add_steer.conditional_gate_stats = gate_stats  # type: ignore[attr-defined]
     return add_steer
 
 
@@ -883,36 +942,35 @@ def evaluate_gamma(
     paired_rng_states: dict[tuple[int, int], dict[str, Any]],
 ) -> dict[str, Any]:
     handle = None
+    steering_hook = None
     if abs(gamma) > 1e-12:
         if steering_vec_cpu is None:
             raise ValueError("Nonzero gamma requires a steering vector.")
         layers = get_transformer_layers(model)
         if args.injection_site == "block_input":
-            handle = layers[layer_index].register_forward_pre_hook(
-                make_cached_input_steering_hook(
-                    steering_vec_cpu,
-                    gamma,
-                    args.injection_sign,
-                    args.injection_scope,
-                    args.injection_token_count,
-                    args.injection_start_generated_token,
-                    args.intervention_mode,
-                    args.resolved_projection_target,
-                )
+            steering_hook = make_cached_input_steering_hook(
+                steering_vec_cpu,
+                gamma,
+                args.injection_sign,
+                args.injection_scope,
+                args.injection_token_count,
+                args.injection_start_generated_token,
+                args.intervention_mode,
+                args.resolved_projection_target,
             )
+            handle = layers[layer_index].register_forward_pre_hook(steering_hook)
         elif args.injection_site == "block_output":
-            handle = layers[layer_index].register_forward_hook(
-                make_cached_output_steering_hook(
-                    steering_vec_cpu,
-                    gamma,
-                    args.injection_sign,
-                    args.injection_scope,
-                    args.injection_token_count,
-                    args.injection_start_generated_token,
-                    args.intervention_mode,
-                    args.resolved_projection_target,
-                )
+            steering_hook = make_cached_output_steering_hook(
+                steering_vec_cpu,
+                gamma,
+                args.injection_sign,
+                args.injection_scope,
+                args.injection_token_count,
+                args.injection_start_generated_token,
+                args.intervention_mode,
+                args.resolved_projection_target,
             )
+            handle = layers[layer_index].register_forward_hook(steering_hook)
         else:
             raise ValueError(f"Unknown injection_site: {args.injection_site}")
 
@@ -1065,7 +1123,7 @@ def evaluate_gamma(
     corruption_artifact_rates = [row["corruption_artifact_rate"] for row in run_metrics]
     correct_mean = int(round(float(np.mean([row["correct"] for row in run_metrics]))))
 
-    return {
+    result = {
         "gamma": float(gamma),
         "accuracy": float(np.mean(accuracies)),
         "correct": correct_mean,
@@ -1080,6 +1138,17 @@ def evaluate_gamma(
         "detailed_results": last_details,
         "failure_cases": failure_cases,
     }
+    gate_stats = getattr(steering_hook, "conditional_gate_stats", None)
+    if gate_stats and gate_stats["positions"]:
+        mask_sums = gate_stats["mask_sums"]
+        steered_positions = int(torch.stack(mask_sums).sum().item())
+        eligible_positions = int(gate_stats["positions"])
+        result["conditional_gate"] = {
+            "eligible_positions": eligible_positions,
+            "steered_positions": steered_positions,
+            "steered_fraction": steered_positions / eligible_positions,
+        }
+    return result
 
 
 def strip_details_for_summary(row: dict[str, Any]) -> dict[str, Any]:
@@ -1188,12 +1257,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--intervention_mode",
-        choices=["additive", "projection_match"],
+        choices=["additive", "projection_match", "conditional_additive"],
         default="additive",
         help=(
             "additive uses h <- h + gamma*v. projection_match interprets gamma "
             "as alpha and interpolates each selected residual projection toward "
-            "the concise target stored in vector metadata."
+            "the concise target stored in vector metadata. conditional_additive "
+            "adds gamma*v only when the current response-state projection falls "
+            "on the verbose side of a calibrated threshold."
+        ),
+    )
+    parser.add_argument(
+        "--projection_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional explicit hidden-state projection threshold for "
+            "conditional_additive. Normally read from selected-vector metadata."
         ),
     )
     parser.add_argument(
@@ -1482,6 +1562,32 @@ def main() -> None:
                     "Pass candidates within that range; extrapolation requires "
                     "--allow_vector_metadata_mismatch and must be labeled diagnostic."
                 )
+        elif args.intervention_mode == "conditional_additive":
+            if args.injection_sign != "add":
+                raise ValueError(
+                    "conditional_additive requires --injection_sign add."
+                )
+            if args.vector_normalization != "unit_l2":
+                raise ValueError(
+                    "conditional_additive requires --vector_normalization unit_l2."
+                )
+            if args.injection_scope != "all_tokens":
+                raise ValueError(
+                    "conditional_additive requires --injection_scope all_tokens."
+                )
+            threshold = args.projection_threshold
+            if threshold is None and vector_metadata is not None:
+                threshold = vector_metadata.get("recommended_projection_threshold")
+            if threshold is None:
+                raise ValueError(
+                    "conditional_additive requires --projection_threshold or "
+                    "selected-vector metadata containing "
+                    "recommended_projection_threshold."
+                )
+            threshold = float(threshold)
+            if not math.isfinite(threshold):
+                raise ValueError("Projection threshold must be finite.")
+            args.resolved_projection_target = threshold
         if vector_metadata is not None and vector_metadata.get("positive_gamma_only"):
             protocol_errors = []
             vector_method = vector_metadata.get("vector_method") or "positive vector"
@@ -1538,6 +1644,8 @@ def main() -> None:
         print(f"  intervention:   {args.intervention_mode}")
         if args.intervention_mode == "projection_match":
             print(f"  projection target:{args.resolved_projection_target:.6f}")
+        elif args.intervention_mode == "conditional_additive":
+            print(f"  projection threshold:{args.resolved_projection_target:.6f}")
     print(
         "  output:         "
         + (args.per_gamma_output_dir if multi_gamma else args.output_path)

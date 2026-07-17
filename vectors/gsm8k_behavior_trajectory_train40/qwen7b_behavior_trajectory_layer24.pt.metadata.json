@@ -38,7 +38,8 @@
   "recommended_injection_token_count": 1,
   "recommended_vector_normalization": "unit_l2",
   "supported_intervention_modes": [
-    "additive"
+    "additive",
+    "conditional_additive"
   ],
   "recommended_intervention_mode": "additive",
   "matching_prompt_mode": "paper_cot",
