@@ -48,6 +48,11 @@ from answer_utils import compare_answers
 from answer_utils import extract_all_answers
 from answer_utils import extract_answer
 from answer_utils import extract_ground_truth
+from loreft_utils import LoReFTBundle
+from loreft_utils import LoReFTHookController
+from loreft_utils import install_loreft_hooks
+from loreft_utils import load_loreft_bundle
+from loreft_utils import validate_loreft_for_model
 
 
 MODEL_CONFIGS = {
@@ -441,8 +446,13 @@ def load_samples(args: argparse.Namespace) -> list[dict[str, str]]:
                 "gt_answer": extract_ground_truth(args.dataset, item),
             }
         )
+    start_index = int(getattr(args, "start_index", 0))
+    if start_index < 0:
+        raise ValueError("--start_index cannot be negative")
     if args.limit > 0:
-        samples = samples[: args.limit]
+        samples = samples[start_index : start_index + args.limit]
+    elif start_index:
+        samples = samples[start_index:]
     return samples
 
 
@@ -803,6 +813,7 @@ def run_batch(
     min_p: float | None,
     repetition_penalty: float,
     input_device: torch.device,
+    intervention_controller: LoReFTHookController | None = None,
 ) -> tuple[list[str], list[int]]:
     inputs = tokenizer(
         prompts,
@@ -811,6 +822,8 @@ def run_batch(
         truncation=True,
         return_token_type_ids=False,
     ).to(input_device)
+    if intervention_controller is not None:
+        intervention_controller.prepare_inference(inputs["attention_mask"])
     prompt_len = inputs["input_ids"].shape[1]
 
     autocast_enabled = input_device.type == "cuda"
@@ -938,16 +951,26 @@ def evaluate_gamma(
     args: argparse.Namespace,
     input_device: torch.device,
     steering_vec_cpu: torch.Tensor | None,
-    layer_index: int,
+    layer_index: int | None,
     paired_rng_states: dict[tuple[int, int], dict[str, Any]],
+    loreft_bundle: LoReFTBundle | None = None,
 ) -> dict[str, Any]:
-    handle = None
+    handles: list[Any] = []
     steering_hook = None
+    loreft_controller = None
     if abs(gamma) > 1e-12:
-        if steering_vec_cpu is None:
-            raise ValueError("Nonzero gamma requires a steering vector.")
         layers = get_transformer_layers(model)
-        if args.injection_site == "block_input":
+        if loreft_bundle is not None:
+            loreft_controller = LoReFTHookController(
+                loreft_bundle.position_spec,
+                scale=gamma,
+            )
+            handles = install_loreft_hooks(layers, loreft_bundle, loreft_controller)
+        elif steering_vec_cpu is None:
+            raise ValueError("Nonzero gamma requires a steering vector or LoReFT adapter.")
+        elif layer_index is None:
+            raise ValueError("Nonzero steering-vector gamma requires a layer index.")
+        elif args.injection_site == "block_input":
             steering_hook = make_cached_input_steering_hook(
                 steering_vec_cpu,
                 gamma,
@@ -958,7 +981,7 @@ def evaluate_gamma(
                 args.intervention_mode,
                 args.resolved_projection_target,
             )
-            handle = layers[layer_index].register_forward_pre_hook(steering_hook)
+            handles = [layers[layer_index].register_forward_pre_hook(steering_hook)]
         elif args.injection_site == "block_output":
             steering_hook = make_cached_output_steering_hook(
                 steering_vec_cpu,
@@ -970,7 +993,7 @@ def evaluate_gamma(
                 args.intervention_mode,
                 args.resolved_projection_target,
             )
-            handle = layers[layer_index].register_forward_hook(steering_hook)
+            handles = [layers[layer_index].register_forward_hook(steering_hook)]
         else:
             raise ValueError(f"Unknown injection_site: {args.injection_site}")
 
@@ -1036,6 +1059,7 @@ def evaluate_gamma(
                     min_p=args.min_p,
                     repetition_penalty=args.repetition_penalty,
                     input_device=input_device,
+                    intervention_controller=loreft_controller,
                 )
                 elapsed = time.time() - t0
                 total_time += elapsed
@@ -1112,7 +1136,9 @@ def evaluate_gamma(
             )
             last_details = details
     finally:
-        if handle is not None:
+        if loreft_controller is not None:
+            loreft_controller.clear()
+        for handle in handles:
             handle.remove()
 
     accuracies = [row["accuracy"] for row in run_metrics]
@@ -1138,6 +1164,9 @@ def evaluate_gamma(
         "detailed_results": last_details,
         "failure_cases": failure_cases,
     }
+    if loreft_bundle is not None:
+        result["intervention_method"] = "LoReFT"
+        result["loreft_scale"] = float(gamma)
     gate_stats = getattr(steering_hook, "conditional_gate_stats", None)
     if gate_stats and gate_stats["positions"]:
         mask_sums = gate_stats["mask_sums"]
@@ -1235,6 +1264,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--loreft_adapter_path",
+        type=str,
+        default=None,
+        help=(
+            "Evaluate a trained LoReFT checkpoint instead of a fixed steering "
+            "vector. Candidate gamma values are interpreted as intervention "
+            "scales; scale=1 is the paper-defined intervention and scale=0 is "
+            "the untouched baseline."
+        ),
+    )
+    parser.add_argument(
+        "--allow_loreft_metadata_mismatch",
+        action="store_true",
+        help="Allow a labeled model/prompt mismatch with a LoReFT checkpoint.",
+    )
+    parser.add_argument(
         "--injection_start_generated_token",
         type=int,
         default=0,
@@ -1304,6 +1349,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_p", type=float, default=None)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--limit", type=int, default=-1)
+    parser.add_argument(
+        "--start_index",
+        type=int,
+        default=0,
+        help="Skip this many dataset rows before applying --limit.",
+    )
     parser.add_argument(
         "--prompt_mode",
         type=str,
@@ -1470,12 +1521,37 @@ def main() -> None:
     cudnn.benchmark = True
 
     args.model_name, cfg = resolve_model_config(args.model_name)
-    if args.steering_vector_path is None:
+    uses_loreft = args.loreft_adapter_path is not None
+    if uses_loreft and cli_has_arg("--steering_vector_path", argv):
+        raise ValueError(
+            "--loreft_adapter_path and --steering_vector_path are mutually exclusive."
+        )
+    if uses_loreft and args.steering:
+        raise ValueError(
+            "Use --candidate_gammas for LoReFT scales; do not combine it with --steering."
+        )
+    if uses_loreft and args.orient_vector_output_path is not None:
+        raise ValueError(
+            "--orient_vector_output_path applies only to fixed steering vectors, not LoReFT."
+        )
+    if not uses_loreft and args.steering_vector_path is None:
         args.steering_vector_path = cfg.get("steering_vector_path")
-    if args.layer_index is None:
+    if not uses_loreft and args.layer_index is None:
         args.layer_index = cfg.get("layer_index")
 
-    candidate_gammas = resolve_candidate_gammas(args, cfg)
+    loreft_default_scales = uses_loreft and not any(
+        cli_has_arg(flag, argv)
+        for flag in (
+            "--candidate_gammas",
+            "--gamma_min",
+            "--gamma_max",
+            "--gamma_steps",
+            "--gamma_override",
+        )
+    )
+    candidate_gammas = (
+        [0.0, 1.0] if loreft_default_scales else resolve_candidate_gammas(args, cfg)
+    )
     if args.paired_batch_seeds and (
         not candidate_gammas or abs(candidate_gammas[0]) > 1e-12
     ):
@@ -1483,7 +1559,30 @@ def main() -> None:
             "--paired_batch_seeds requires gamma=0 to be the first candidate."
         )
     multi_gamma = len(candidate_gammas) > 1
-    needs_steering_vector = any(abs(gamma) > 1e-12 for gamma in candidate_gammas)
+    needs_nonzero_intervention = any(
+        abs(gamma) > 1e-12 for gamma in candidate_gammas
+    )
+    needs_steering_vector = needs_nonzero_intervention and not uses_loreft
+    if uses_loreft and any(gamma < -1e-12 for gamma in candidate_gammas):
+        raise ValueError(
+            "Negative LoReFT scales are outside the paper-defined intervention. "
+            "Use scale 0 for baseline and scale 1 for the trained intervention."
+        )
+    noncanonical_loreft_scales = [
+        gamma
+        for gamma in candidate_gammas
+        if not (abs(gamma) <= 1e-12 or abs(gamma - 1.0) <= 1e-12)
+    ]
+    if (
+        uses_loreft
+        and noncanonical_loreft_scales
+        and not args.allow_loreft_metadata_mismatch
+    ):
+        raise ValueError(
+            "Canonical LoReFT evaluation uses only scale 0 (baseline) and scale 1 "
+            f"(paper intervention); got {noncanonical_loreft_scales}. Pass "
+            "--allow_loreft_metadata_mismatch only for a labeled scale diagnostic."
+        )
     if needs_steering_vector and args.steering_vector_path is None:
         raise ValueError(
             "Nonzero gamma requires a steering vector. For new models, pass "
@@ -1617,6 +1716,7 @@ def main() -> None:
     print("ASC paper evaluation")
     print(f"  model:          {args.model_name}")
     print(f"  dataset:        {args.dataset}")
+    print(f"  start index:    {args.start_index}")
     print(f"  limit:          {args.limit}")
     print(f"  prompt:         {args.prompt_mode}")
     if is_qwen3_model(args.model_name):
@@ -1629,9 +1729,14 @@ def main() -> None:
     print(f"  batch_size:     {args.batch_size}")
     print(f"  max_new_tokens: {args.max_new_tokens}")
     print(f"  device_map:     {args.resolved_device_map}")
+    scale_label = "LoReFT scales" if uses_loreft else "gammas"
     print(
-        "  gammas:         " + ", ".join(f"{gamma:.6g}" for gamma in candidate_gammas)
+        f"  {scale_label}:         "
+        + ", ".join(f"{gamma:.6g}" for gamma in candidate_gammas)
     )
+    if uses_loreft:
+        print(f"  LoReFT adapter: {args.loreft_adapter_path}")
+        print("  LoReFT scope:   selected prompt positions only")
     if needs_steering_vector:
         print(f"  vector:         {args.steering_vector_path}")
         print(f"  layer:          {args.layer_index}")
@@ -1684,6 +1789,23 @@ def main() -> None:
     if hasattr(model, "hf_device_map"):
         print(f"  hf_device_map summary: {summarize_device_map(model.hf_device_map)}")
 
+    loreft_bundle = None
+    if uses_loreft:
+        loreft_bundle = load_loreft_bundle(args.loreft_adapter_path)
+        validate_loreft_for_model(
+            loreft_bundle,
+            model,
+            args.model_name,
+            args.prompt_mode,
+            allow_mismatch=args.allow_loreft_metadata_mismatch,
+        )
+        print(
+            "  LoReFT metadata: "
+            f"layers={loreft_bundle.layer_indices}, rank={loreft_bundle.rank}, "
+            f"positions={loreft_bundle.position_spec}, "
+            f"params={loreft_bundle.trainable_parameter_count:,}"
+        )
+
     print("[3/4] Loading samples")
     samples = load_samples(args)
     if not samples:
@@ -1712,6 +1834,8 @@ def main() -> None:
                 f"tokens={vector_metadata.get('recommended_injection_token_count')}, "
                 f"normalization={vector_metadata.get('recommended_vector_normalization')}"
             )
+    elif uses_loreft:
+        print("[4/4] Running LoReFT scales (0=baseline, 1=paper intervention)")
     else:
         print("[4/4] Running gammas")
 
@@ -1736,6 +1860,7 @@ def main() -> None:
                 steering_vec_cpu=steering_vec_cpu,
                 layer_index=args.layer_index,
                 paired_rng_states=paired_rng_states,
+                loreft_bundle=loreft_bundle,
             )
 
             details = row.pop("detailed_results")
@@ -1778,8 +1903,9 @@ def main() -> None:
                 write_json_atomic(fail_path, failure_cases)
 
             gamma_results.append(row)
+            parameter_name = "scale" if uses_loreft else "gamma"
             print(
-                f"  gamma={gamma:.6g}: acc={row['accuracy']:.4f}, "
+                f"  {parameter_name}={gamma:.6g}: acc={row['accuracy']:.4f}, "
                 f"tokens={row['avg_tokens']:.1f}, time={row['avg_time_sec']:.2f}s, "
                 f"repeat={row['repetition_artifact_rate']:.2%}, "
                 f"corrupt={row['corruption_artifact_rate']:.2%}"
@@ -1821,13 +1947,31 @@ def main() -> None:
     print("\n" + "=" * 72)
     print("RESULT")
     for row in gamma_results:
+        parameter_name = "scale" if uses_loreft else "gamma"
         print(
-            f"  gamma={row['gamma']:.6g} | acc={row['accuracy']:.4f} "
+            f"  {parameter_name}={row['gamma']:.6g} | acc={row['accuracy']:.4f} "
             f"({row['correct']}/{row['total']}) | tokens={row['avg_tokens']:.1f} "
             f"| time={row['avg_time_sec']:.2f}s "
             f"| repeat={row['repetition_artifact_rate']:.2%} "
             f"| corrupt={row['corruption_artifact_rate']:.2%}"
         )
+    if uses_loreft:
+        baseline = next(
+            (row for row in gamma_results if abs(row["gamma"]) <= 1e-12),
+            None,
+        )
+        canonical = next(
+            (row for row in gamma_results if abs(row["gamma"] - 1.0) <= 1e-12),
+            None,
+        )
+        if baseline is not None and canonical is not None:
+            compression = 1.0 - canonical["avg_tokens"] / baseline["avg_tokens"]
+            accuracy_delta = canonical["accuracy"] - baseline["accuracy"]
+            print(
+                "  LoReFT scale=1 vs 0: "
+                f"compression={compression:.2%}, "
+                f"accuracy_delta={accuracy_delta:+.2%}"
+            )
     if stopped_early:
         print(f"  stopped early:  {stop_reason}")
     print("=" * 72)

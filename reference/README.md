@@ -1,5 +1,21 @@
 # Activation-steering literature and code index
 
+## LoReFT / ReFT addition (2026-07-17)
+
+- Paper: `papers/reft_neurips2024.pdf` (NeurIPS 2024).
+- Official source snapshot: `pyreft-source/` from
+  `stanfordnlp/pyreft@dafd0995a366d7b47160a337dcc388eda7431821`.
+- Project adaptation and audit boundary: `docs/LOREFT_CONCISENESS_PROTOCOL.md`.
+
+LoReFT is retained because it learns a low-rank causal representation
+intervention instead of assuming one fixed mean direction.  The upstream
+repository had about 1.6k stars, 132 forks, and 454 commits when checked in
+July 2026; its latest commit in this snapshot is dated 2025-02-06, so adoption
+is strong but current maintenance activity should not be overstated.
+The snapshot excludes bundled datasets, notebooks, plots, and unrelated task
+examples; it retains the library, license, top-level README, and the complete
+`examples/loreft/` replication code needed for comparison.
+
 本目录保存 ASC 后续开发需要反复核对的论文与作者代码。新增源码采用“可审计快照”而不是嵌套 Git 仓库：每个快照都固定到下载时的上游 commit，并排除了模型权重、预计算向量和大体积实验输出。这样可以随主项目经 GitHub 中转，又不会把仓库膨胀到数百 MB。
 
 ## 本轮新增的核心资料

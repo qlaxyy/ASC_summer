@@ -24,6 +24,12 @@ results/RESULT_SUMMARY.md
 > `null_result`。当前可靠结论是：单一平均方向具有表示区分度，但尚不能稳定控制
 > 自由生成长度。详见 `docs/SINGLE_VECTOR_CAUSAL_AUDIT.md`。
 
+下一阶段已经切换到 LoReFT 低秩表示干预：冻结基础模型，只学习论文定义的
+`h + R^T(Wh + b - Rh)` 提示位置干预，不再继续调同一根平均向量。实现入口为
+`train_loreft_conciseness.py` 和 `loreft_utils.py`；理论边界、数据隔离、停止规则与
+AutoDL 命令见 `docs/LOREFT_CONCISENESS_PROTOCOL.md`。该方向目前仍是待证伪 pilot，
+不能在取得独立验证结果前宣称有效。
+
 当前已经完成的主要工作：
 
 - 整理出相对独立的 ASC 实验管线；
