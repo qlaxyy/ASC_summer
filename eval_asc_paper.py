@@ -478,6 +478,7 @@ def load_and_validate_vector_metadata(
     intervention_mode: str,
     prompt_mode: str,
     allow_mismatch: bool,
+    injection_start_generated_token: int = 0,
 ) -> dict[str, Any] | None:
     metadata_path = Path(vector_path + ".metadata.json")
     if not metadata_path.exists():
@@ -490,6 +491,9 @@ def load_and_validate_vector_metadata(
     expected_scope = metadata.get("recommended_injection_scope")
     expected_prompt_mode = metadata.get("matching_prompt_mode")
     expected_token_count = metadata.get("recommended_injection_token_count")
+    expected_start_token = metadata.get(
+        "recommended_injection_start_generated_token"
+    )
     expected_normalization = metadata.get("recommended_vector_normalization")
     supported_intervention_modes = metadata.get("supported_intervention_modes")
     mismatches = []
@@ -513,6 +517,15 @@ def load_and_validate_vector_metadata(
         mismatches.append(
             f"injection_token_count={injection_token_count!r}, metadata expects "
             f"{int(expected_token_count)!r}"
+        )
+    if (
+        expected_start_token is not None
+        and int(expected_start_token) != injection_start_generated_token
+    ):
+        mismatches.append(
+            "injection_start_generated_token="
+            f"{injection_start_generated_token!r}, metadata expects "
+            f"{int(expected_start_token)!r}"
         )
     if expected_normalization and expected_normalization != vector_normalization:
         mismatches.append(
@@ -604,6 +617,7 @@ def make_cached_output_steering_hook(
     injection_sign: str,
     injection_scope: str,
     injection_token_count: int,
+    injection_start_generated_token: int = 0,
     intervention_mode: str = "additive",
     projection_target: float | None = None,
 ):
@@ -611,15 +625,30 @@ def make_cached_output_steering_hook(
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
     if injection_scope not in {"prompt_only", "all_tokens", "sequence_all"}:
         raise ValueError(f"Unsupported injection_scope: {injection_scope}")
+    if injection_start_generated_token < 0:
+        raise ValueError("injection_start_generated_token cannot be negative")
+    if injection_start_generated_token and injection_scope != "all_tokens":
+        raise ValueError(
+            "Delayed steering is defined only for injection_scope='all_tokens'."
+        )
     multiplier = 1.0 if injection_sign == "add" else -1.0
     if intervention_mode not in {"additive", "projection_match"}:
         raise ValueError(f"Unsupported intervention_mode: {intervention_mode}")
     if intervention_mode == "projection_match" and projection_target is None:
         raise ValueError("projection_match requires projection_target")
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+    state = {"generated_tokens_seen": 0}
 
     def add_steer(_, __, output):
         hidden = output[0]
+        if injection_start_generated_token:
+            if hidden.shape[1] > 1:
+                # A new batched prefill resets the cached-generation counter.
+                state["generated_tokens_seen"] = 0
+                return None
+            state["generated_tokens_seen"] += 1
+            if state["generated_tokens_seen"] < injection_start_generated_token:
+                return None
         if injection_scope == "prompt_only" and hidden.shape[1] <= 1:
             return None
         target = (
@@ -649,6 +678,7 @@ def make_cached_input_steering_hook(
     injection_sign: str,
     injection_scope: str,
     injection_token_count: int,
+    injection_start_generated_token: int = 0,
     intervention_mode: str = "additive",
     projection_target: float | None = None,
 ):
@@ -656,15 +686,29 @@ def make_cached_input_steering_hook(
         raise ValueError(f"Unsupported injection_sign: {injection_sign}")
     if injection_scope not in {"prompt_only", "all_tokens", "sequence_all"}:
         raise ValueError(f"Unsupported injection_scope: {injection_scope}")
+    if injection_start_generated_token < 0:
+        raise ValueError("injection_start_generated_token cannot be negative")
+    if injection_start_generated_token and injection_scope != "all_tokens":
+        raise ValueError(
+            "Delayed steering is defined only for injection_scope='all_tokens'."
+        )
     multiplier = 1.0 if injection_sign == "add" else -1.0
     if intervention_mode not in {"additive", "projection_match"}:
         raise ValueError(f"Unsupported intervention_mode: {intervention_mode}")
     if intervention_mode == "projection_match" and projection_target is None:
         raise ValueError("projection_match requires projection_target")
     cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+    state = {"generated_tokens_seen": 0}
 
     def add_steer(_module, inputs):
         hidden = inputs[0]
+        if injection_start_generated_token:
+            if hidden.shape[1] > 1:
+                state["generated_tokens_seen"] = 0
+                return None
+            state["generated_tokens_seen"] += 1
+            if state["generated_tokens_seen"] < injection_start_generated_token:
+                return None
         if injection_scope == "prompt_only" and hidden.shape[1] <= 1:
             return None
         target = (
@@ -851,6 +895,7 @@ def evaluate_gamma(
                     args.injection_sign,
                     args.injection_scope,
                     args.injection_token_count,
+                    args.injection_start_generated_token,
                     args.intervention_mode,
                     args.resolved_projection_target,
                 )
@@ -863,6 +908,7 @@ def evaluate_gamma(
                     args.injection_sign,
                     args.injection_scope,
                     args.injection_token_count,
+                    args.injection_start_generated_token,
                     args.intervention_mode,
                     args.resolved_projection_target,
                 )
@@ -1120,6 +1166,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--injection_start_generated_token",
+        type=int,
+        default=0,
+        help=(
+            "Leave this many generated response tokens unsteered, then apply "
+            "the vector on cached generation steps. Zero preserves the original "
+            "final-prompt-plus-generation behavior. Delayed steering requires "
+            "--injection_scope all_tokens."
+        ),
+    )
+    parser.add_argument(
         "--vector_normalization",
         choices=["none", "unit_l2"],
         default="none",
@@ -1371,6 +1428,16 @@ def main() -> None:
         )
     if args.orientation_accuracy_tolerance < 0:
         raise ValueError("--orientation_accuracy_tolerance must be nonnegative.")
+    if args.injection_start_generated_token < 0:
+        raise ValueError("--injection_start_generated_token cannot be negative.")
+    if (
+        args.injection_start_generated_token > 0
+        and args.injection_scope != "all_tokens"
+    ):
+        raise ValueError(
+            "--injection_start_generated_token > 0 requires "
+            "--injection_scope all_tokens."
+        )
 
     vector_metadata = None
     args.resolved_projection_target = None
@@ -1385,6 +1452,7 @@ def main() -> None:
             args.intervention_mode,
             args.prompt_mode,
             args.allow_vector_metadata_mismatch,
+            args.injection_start_generated_token,
         )
         if args.intervention_mode == "projection_match":
             if args.injection_sign != "add":
@@ -1465,6 +1533,7 @@ def main() -> None:
         print(f"  injection site: {args.injection_site}")
         print(f"  injection scope:{args.injection_scope}")
         print(f"  injection tokens:{args.injection_token_count}")
+        print(f"  steering starts after:{args.injection_start_generated_token} tokens")
         print(f"  vector norm mode:{args.vector_normalization}")
         print(f"  intervention:   {args.intervention_mode}")
         if args.intervention_mode == "projection_match":

@@ -65,6 +65,35 @@ class CausalVectorSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(select_best_candidate(candidates)["gamma"], 1.0)
 
+    def test_robust_checks_reject_outlier_driven_mean_compression(self):
+        baseline = self.baseline()
+        candidate = self.candidate(avg_tokens=800.0)
+        baseline["detailed_results"] = [
+            {"question": f"q{i}", "tokens": 1000} for i in range(10)
+        ]
+        candidate["detailed_results"] = [
+            {"question": f"q{i}", "tokens": token_count}
+            for i, token_count in enumerate([200, 200] + [1050] * 8)
+        ]
+
+        result = assess_candidate(
+            baseline,
+            candidate,
+            0.05,
+            0.04,
+            0.04,
+            0.0,
+            0.04,
+            min_trimmed_compression=0.02,
+            min_pairwise_win_margin=0.0,
+            trim_fraction=0.1,
+        )
+
+        self.assertFalse(result["eligible"])
+        self.assertIn("negative_pairwise_win_margin", result["rejection_reasons"])
+        self.assertEqual(result["paired_shorter_count"], 2)
+        self.assertEqual(result["paired_longer_count"], 8)
+
 
 
 @unittest.skipIf(

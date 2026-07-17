@@ -2,25 +2,27 @@
 
 The representation direction is never flipped: every candidate must already be
 target-minus-source and is applied as ``h <- h + gamma * v`` with gamma > 0.
-This script only selects the layer and positive strength whose generated outputs
-show held-out compression without unacceptable quality regressions.
+This script selects the layer, positive strength, and optional generated-token
+start threshold whose outputs show robust held-out compression without
+unacceptable quality regressions.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import time
 from pathlib import Path
 from typing import Any
 
 
-def parse_int_list(text: str) -> list[int]:
+def parse_int_list(text: str, label: str = "integer") -> list[int]:
     values = [int(part.strip()) for part in text.split(",") if part.strip()]
     if not values:
-        raise ValueError("The layer list cannot be empty.")
+        raise ValueError(f"The {label} list cannot be empty.")
     if any(value < 0 for value in values):
-        raise ValueError("Layer indices cannot be negative.")
+        raise ValueError(f"{label.capitalize()} values cannot be negative.")
     return list(dict.fromkeys(values))
 
 
@@ -61,6 +63,9 @@ def assess_candidate(
     max_repetition_increase: float,
     max_corruption_rate: float,
     max_length_capped_increase: float,
+    min_trimmed_compression: float = 0.0,
+    min_pairwise_win_margin: float = -1.0,
+    trim_fraction: float = 0.1,
 ) -> dict[str, Any]:
     baseline_tokens = float(baseline["avg_tokens"])
     if baseline_tokens <= 0:
@@ -75,6 +80,50 @@ def assess_candidate(
     )
     corruption_rate = float(candidate["corruption_artifact_rate"])
 
+    paired_diagnostics: dict[str, Any] = {}
+    baseline_details = baseline.get("detailed_results") or []
+    candidate_details = candidate.get("detailed_results") or []
+    robust_checks_requested = (
+        min_trimmed_compression > 0 or min_pairwise_win_margin > -1
+    )
+    if robust_checks_requested:
+        if len(baseline_details) != len(candidate_details) or not baseline_details:
+            raise ValueError(
+                "Robust causal selection requires paired detailed_results. "
+                "Use --save_details all."
+            )
+        if not 0 <= trim_fraction < 0.5:
+            raise ValueError("trim_fraction must be in [0, 0.5).")
+        paired_rows = []
+        for baseline_row, candidate_row in zip(
+            baseline_details, candidate_details, strict=True
+        ):
+            if baseline_row.get("question") != candidate_row.get("question"):
+                raise ValueError("Baseline/candidate detailed results are not paired.")
+            baseline_length = int(baseline_row["tokens"])
+            candidate_length = int(candidate_row["tokens"])
+            paired_rows.append(
+                (baseline_length - candidate_length, baseline_length)
+            )
+        shorter_count = sum(saving > 0 for saving, _ in paired_rows)
+        longer_count = sum(saving < 0 for saving, _ in paired_rows)
+        same_count = len(paired_rows) - shorter_count - longer_count
+        win_margin = (shorter_count - longer_count) / len(paired_rows)
+        trim_count = math.floor(len(paired_rows) * trim_fraction)
+        ranked = sorted(paired_rows, key=lambda row: row[0])
+        retained = ranked[trim_count : len(ranked) - trim_count or None]
+        retained_baseline_mean = sum(row[1] for row in retained) / len(retained)
+        retained_saving_mean = sum(row[0] for row in retained) / len(retained)
+        trimmed_compression = retained_saving_mean / retained_baseline_mean
+        paired_diagnostics = {
+            "paired_shorter_count": shorter_count,
+            "paired_longer_count": longer_count,
+            "paired_same_count": same_count,
+            "pairwise_win_margin": win_margin,
+            "trim_fraction": trim_fraction,
+            "trimmed_compression_fraction": trimmed_compression,
+        }
+
     failures: list[str] = []
     epsilon = 1e-12
     if compression + epsilon < min_compression:
@@ -87,6 +136,17 @@ def assess_candidate(
         failures.append("corruption_artifact")
     if length_capped_increase > max_length_capped_increase + epsilon:
         failures.append("length_capped_increase")
+    if paired_diagnostics:
+        if (
+            paired_diagnostics["trimmed_compression_fraction"] + epsilon
+            < min_trimmed_compression
+        ):
+            failures.append("insufficient_trimmed_compression")
+        if (
+            paired_diagnostics["pairwise_win_margin"] + epsilon
+            < min_pairwise_win_margin
+        ):
+            failures.append("negative_pairwise_win_margin")
 
     return {
         "compression_fraction": compression,
@@ -96,6 +156,7 @@ def assess_candidate(
         "length_capped_increase": length_capped_increase,
         "eligible": not failures,
         "rejection_reasons": failures,
+        **paired_diagnostics,
     }
 
 
@@ -111,6 +172,7 @@ def select_best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | 
             -row["corruption_artifact_rate"],
             -row["repetition_artifact_rate"],
             -row["gamma"],
+            row.get("injection_start_generated_token", 0),
         ),
     )
 
@@ -126,8 +188,9 @@ def compact_metrics(row: dict[str, Any]) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Select one positive-add conciseness vector using held-out GSM8K train "
-            "generations; the GSM8K test set is never read."
+            "Select one positive-add conciseness intervention (including an "
+            "optional delayed start) using held-out GSM8K train generations; "
+            "the GSM8K test set is never read."
         )
     )
     parser.add_argument(
@@ -139,6 +202,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file_prefix", required=True)
     parser.add_argument("--layer_indices", default="16,20,24")
     parser.add_argument("--candidate_gammas", default="0.5,1.0")
+    parser.add_argument(
+        "--candidate_start_tokens",
+        default="0",
+        help=(
+            "Comma-separated generated-token counts to leave unsteered before "
+            "activating each positive-gamma candidate. Zero preserves immediate "
+            "steering. Delayed candidates require --injection_scope all_tokens."
+        ),
+    )
     parser.add_argument("--validation_samples", type=int, default=30)
     parser.add_argument("--validation_seed", type=int, default=314159)
     parser.add_argument(
@@ -156,6 +228,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_repetition_increase", type=float, default=0.04)
     parser.add_argument("--max_corruption_rate", type=float, default=0.0)
     parser.add_argument("--max_length_capped_increase", type=float, default=0.04)
+    parser.add_argument("--min_trimmed_compression", type=float, default=0.02)
+    parser.add_argument("--min_pairwise_win_margin", type=float, default=0.0)
+    parser.add_argument("--trim_fraction", type=float, default=0.1)
     parser.add_argument(
         "--output_report",
         default="results/causal_conciseness_selection.json",
@@ -199,6 +274,7 @@ def validate_thresholds(args: argparse.Namespace) -> None:
         "max_repetition_increase",
         "max_corruption_rate",
         "max_length_capped_increase",
+        "min_trimmed_compression",
     ):
         value = getattr(args, name)
         if value < 0:
@@ -207,6 +283,17 @@ def validate_thresholds(args: argparse.Namespace) -> None:
         raise ValueError("--batch_size must be positive.")
     if args.max_new_tokens <= 0:
         raise ValueError("--max_new_tokens must be positive.")
+    if not -1 <= args.min_pairwise_win_margin <= 1:
+        raise ValueError("--min_pairwise_win_margin must be in [-1, 1].")
+    if not 0 <= args.trim_fraction < 0.5:
+        raise ValueError("--trim_fraction must be in [0, 0.5).")
+    if (
+        (args.min_trimmed_compression > 0 or args.min_pairwise_win_margin > -1)
+        and args.save_details != "all"
+    ):
+        raise ValueError(
+            "Robust paired selection requires --save_details all."
+        )
 
 
 def main() -> None:
@@ -232,8 +319,17 @@ def main() -> None:
     from eval_asc_paper import write_json_atomic
 
     validate_thresholds(args)
-    layers = parse_int_list(args.layer_indices)
+    layers = parse_int_list(args.layer_indices, "layer")
     gammas = parse_positive_float_list(args.candidate_gammas)
+    start_tokens = parse_int_list(args.candidate_start_tokens, "start-token")
+    if any(value >= args.max_new_tokens for value in start_tokens):
+        raise ValueError(
+            "Every delayed start token must be smaller than --max_new_tokens."
+        )
+    if any(start_tokens) and args.injection_scope != "all_tokens":
+        raise ValueError(
+            "Delayed candidates require --injection_scope all_tokens."
+        )
     vector_dir = Path(args.vector_dir)
     if Path(args.output_vector_path).exists():
         raise FileExistsError(
@@ -322,6 +418,7 @@ def main() -> None:
     args.injection_sign = "add"
     args.injection_site = "block_output"
     args.injection_token_count = 1
+    args.injection_start_generated_token = 0
     args.vector_normalization = "unit_l2"
     args.intervention_mode = "additive"
     args.resolved_projection_target = None
@@ -337,6 +434,7 @@ def main() -> None:
     print(f"  validation samples: {len(samples)}")
     print(f"  layers: {layers}")
     print(f"  positive gammas: {gammas}")
+    print(f"  generated-token start candidates: {start_tokens}")
     print(
         "  generation protocol: "
         f"paper_cot, temperature={args.temperature}, top_p={args.top_p}, "
@@ -370,13 +468,16 @@ def main() -> None:
         "max_repetition_increase": args.max_repetition_increase,
         "max_corruption_rate": args.max_corruption_rate,
         "max_length_capped_increase": args.max_length_capped_increase,
+        "min_trimmed_compression": args.min_trimmed_compression,
+        "min_pairwise_win_margin": args.min_pairwise_win_margin,
+        "trim_fraction": args.trim_fraction,
     }
     report: dict[str, Any] = {
         "status": "running",
-        "method": "held_out_causal_layer_and_positive_gamma_selection",
+        "method": "held_out_causal_layer_gamma_and_start_selection",
         "invariant": (
             "v=concise_target-source; h<-h+gamma*v; gamma>0; "
-            f"scope={args.injection_scope}"
+            f"scope={args.injection_scope}; delayed_start_candidates={start_tokens}"
         ),
         "model_name": args.model_name,
         "data": {
@@ -431,35 +532,41 @@ def main() -> None:
         if not torch.isfinite(vector_norm) or vector_norm <= 0:
             raise ValueError(f"Invalid vector norm for {spec['vector_path']}")
         vector = vector / vector_norm
-        for gamma in gammas:
-            print(f"[candidate] layer={spec['layer_index']}, gamma={gamma:.6g}")
-            metrics = evaluate_gamma(
-                gamma=gamma,
-                model=model,
-                tokenizer=tokenizer,
-                samples=samples,
-                args=args,
-                input_device=input_device,
-                steering_vec_cpu=vector,
-                layer_index=spec["layer_index"],
-                paired_rng_states=paired_rng_states,
-            )
-            assessment = assess_candidate(baseline, metrics, **criteria)
-            candidate = {
-                **metrics,
-                **assessment,
-                "layer_index": spec["layer_index"],
-                "vector_path": spec["vector_path"],
-            }
-            report["candidates"].append(candidate)
-            write_json_atomic(args.output_report, report)
-            verdict = "PASS" if candidate["eligible"] else "reject"
-            print(
-                f"  {verdict}: acc={candidate['accuracy']:.4f}, "
-                f"tokens={candidate['avg_tokens']:.1f}, "
-                f"compression={candidate['compression_fraction']:.2%}, "
-                f"reasons={candidate['rejection_reasons']}"
-            )
+        for start_token in start_tokens:
+            args.injection_start_generated_token = start_token
+            for gamma in gammas:
+                print(
+                    f"[candidate] layer={spec['layer_index']}, gamma={gamma:.6g}, "
+                    f"start_after={start_token}"
+                )
+                metrics = evaluate_gamma(
+                    gamma=gamma,
+                    model=model,
+                    tokenizer=tokenizer,
+                    samples=samples,
+                    args=args,
+                    input_device=input_device,
+                    steering_vec_cpu=vector,
+                    layer_index=spec["layer_index"],
+                    paired_rng_states=paired_rng_states,
+                )
+                assessment = assess_candidate(baseline, metrics, **criteria)
+                candidate = {
+                    **metrics,
+                    **assessment,
+                    "layer_index": spec["layer_index"],
+                    "vector_path": spec["vector_path"],
+                    "injection_start_generated_token": start_token,
+                }
+                report["candidates"].append(candidate)
+                write_json_atomic(args.output_report, report)
+                verdict = "PASS" if candidate["eligible"] else "reject"
+                print(
+                    f"  {verdict}: acc={candidate['accuracy']:.4f}, "
+                    f"tokens={candidate['avg_tokens']:.1f}, "
+                    f"compression={candidate['compression_fraction']:.2%}, "
+                    f"reasons={candidate['rejection_reasons']}"
+                )
 
     selected = select_best_candidate(report["candidates"])
     if selected is None:
@@ -496,6 +603,9 @@ def main() -> None:
         "matching_injection_site": "block_output",
         "recommended_injection_scope": args.injection_scope,
         "recommended_injection_token_count": 1,
+        "recommended_injection_start_generated_token": selected[
+            "injection_start_generated_token"
+        ],
         "recommended_vector_normalization": "unit_l2",
         "recommended_intervention_mode": "additive",
         "positive_gamma_only": True,
@@ -518,6 +628,7 @@ def main() -> None:
     print("RESULT: selected a held-out causal candidate")
     print(
         f"  layer={selected['layer_index']}, gamma={selected['gamma']:.6g}, "
+        f"start_after={selected['injection_start_generated_token']}, "
         f"compression={selected['compression_fraction']:.2%}, "
         f"accuracy_drop={selected['accuracy_drop']:.2%}"
     )

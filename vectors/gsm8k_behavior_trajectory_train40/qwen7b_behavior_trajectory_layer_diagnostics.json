@@ -1,0 +1,41 @@
+{
+  "method": "behavior_trajectory_relative_progress_bins",
+  "direction_semantics": "target_minus_source",
+  "pairs_path": "pairs/gsm8k_behavior_trajectory_pairs_train40.json",
+  "num_pairs": 40,
+  "num_relative_bins": 8,
+  "mean_concise_tokens": 382.475,
+  "mean_verbose_tokens": 1012.5,
+  "mean_pair_compression": 0.6222469135802469,
+  "ranking": [
+    {
+      "layer_index": 24,
+      "vector_path": "vectors/gsm8k_behavior_trajectory_train40/qwen7b_behavior_trajectory_layer24.pt",
+      "num_pairs": 40,
+      "num_relative_bins": 8,
+      "hidden_size": 3584,
+      "raw_mean_vector_norm": 64.91808319091797,
+      "mean_pair_vector_norm": 112.22492980957031,
+      "mean_resultant_ratio": 0.5784640312194824,
+      "orientation_pair_agreement": 0.8999999761581421,
+      "mean_projection_margin": 64.9180908203125,
+      "projection_margin_std": 47.001522064208984,
+      "projection_signal_to_noise": 1.3811912536621094,
+      "relative_bin_direction_cosines": [
+        0.4669038653373718,
+        0.6666701436042786,
+        0.6927030086517334,
+        0.7899230122566223,
+        0.9118935465812683,
+        0.8992304801940918,
+        0.8131435513496399,
+        0.5456954836845398
+      ],
+      "relative_bin_cosine_min": 0.4669038653373718,
+      "relative_bin_cosine_mean": 0.7232703864574432,
+      "concise_projection_mean": -47.25156784057617,
+      "verbose_projection_mean": -112.1696548461914
+    }
+  ],
+  "created_at_unix": 1784276783.322009
+}
