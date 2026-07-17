@@ -93,3 +93,16 @@ python select_causal_conciseness_vector.py \
 若结果是 `null_result`，则延迟门控也没有通过当前因果标准，停止该候选而不进入
 test。若结果是 `selected`，先审计逐题分布并冻结 `start_after`；不得根据 test
 300--399 再修改阈值或 gamma。
+
+## 实际结果
+
+独立 train validation（seed 20260717）baseline 为 29/30、657.5 tokens：
+
+| start_after | Accuracy | Avg tokens | Raw compression | 10% trimmed compression | shorter/longer/same |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 29/30 | 677.4 | -3.03% | 0.00% | 2/3/25 |
+| 768 | 29/30 | 643.3 | 2.15% | 0.00% | 2/0/28 |
+| 1024 | 29/30 | 661.1 | -0.54% | 0.00% | 0/1/29 |
+
+768 的表面压缩只来自 2 道题，其余 28 道完全不变；所有候选均为
+`null_result`。延迟门控分支因此终止。

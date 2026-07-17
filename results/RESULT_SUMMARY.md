@@ -13,10 +13,28 @@ Token compression = (CoT avg tokens - ASC avg tokens) / CoT avg tokens
 
 ## Main Findings
 
-- Qwen3-8B 在官方 thinking-mode 口径下，`Self-extracted vector + gamma=0.65` 可以在 GSM8K 上保持 `96.00%` 正确率，并把平均输出从 `1908.30` tokens 降到 `1467.00` tokens，压缩约 `23.1%`。
-- DeepSeek-R1-Distill-Qwen-7B 上的新向量在 GSM8K 和 MATH 上都能带来稳定压缩信号，其中 GSM8K 上可达到约 `30%+` token 压缩。
-- 原作者向量在 DeepSeek-R1-Distill-Qwen-7B/GSM8K 与 DeepSeek-R1-Distill-Qwen-7B/MATH 上仍然有效，但新向量在部分设置下可以支持更高 gamma。
-- DeepSeek-R1-Distill-Llama-8B 结果显示 ASC 也能压缩 token，但高 gamma 更容易损伤正确率，因此需要更谨慎选择 gamma。
+- 下方各模型表格是早期 exploratory sweep 的历史记录，不是当前因果有效性结论。
+- DeepSeek-R1-Distill-Qwen-7B/GSM8K 的严格复现中，单一行为轨迹向量在两个
+  100 题切片上分别压缩 7.92% 和增长 7.08%；合并压缩仅 0.87%，准确率同为
+  91%，bootstrap 95% 区间跨过 0。
+- 在两个新的 GSM8K train validation split 上，长度延迟门控与隐藏状态条件门控
+  均为 `null_result`；门控实际触发但没有稳健压缩。
+- 因此不能继续声称该自提取向量在 DeepSeek-R1-Distill-Qwen-7B 上“稳定压缩”。
+  Qwen3、MATH 和作者向量结果尚未按同等协议复核，当前保留为待审计信号。
+
+## Rigorous causal audit: Qwen-7B / GSM8K
+
+| Stage | Split | Result |
+|---|---|---|
+| Immediate positive-add | test 100--199 | 7.92% compression, accuracy 90% → 89% |
+| Immediate positive-add | test 200--299 | -7.08% compression, accuracy 92% → 93% |
+| Combined | 200 development-audit questions | 0.87% compression, both 91% |
+| Delayed 512/768/1024 | fresh train validation 30 | all `null_result` |
+| State gate alpha .25/.50/.75 | fresh train validation 30 | -7.36%/-10.41%/-10.48% raw compression |
+
+结论：当前单一平均方向可以区分 teacher-forced concise/verbose 表示，但不足以对
+自由生成产生可泛化的简洁性因果控制。完整证据见
+`docs/SINGLE_VECTOR_CAUSAL_AUDIT.md`。
 
 ## Qwen3-8B / GSM8K
 

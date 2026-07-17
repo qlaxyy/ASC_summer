@@ -16,6 +16,14 @@ results/RESULT_SUMMARY.md
 
 ## 当前阶段结论
 
+> **因果审计更新（2026-07）**：早期小样本/gamma sweep 表中的压缩数字只能视为
+> 探索性结果，不能再解释为稳定因果效果。对 DeepSeek-R1-Distill-Qwen-7B 的
+> target-minus-source 行为轨迹向量完成数据隔离、paired RNG、异常检查和跨切片
+> 复现后，200 道 test development audit 的合并压缩率只有 0.87%，95% bootstrap
+> 区间跨过 0；延迟门控与隐藏状态条件门控也均在独立 train validation 上得到
+> `null_result`。当前可靠结论是：单一平均方向具有表示区分度，但尚不能稳定控制
+> 自由生成长度。详见 `docs/SINGLE_VECTOR_CAUSAL_AUDIT.md`。
+
 当前已经完成的主要工作：
 
 - 整理出相对独立的 ASC 实验管线；
@@ -26,7 +34,8 @@ results/RESULT_SUMMARY.md
 - 支持 Qwen3-8B thinking mode 的官方推荐采样参数；
 - 尝试实现论文 KL gamma 公式，并记录其工程困难。
 
-当前比较有价值的阶段性结果如下。表中的压缩率均相对于同模型、同数据集的 CoT baseline 计算。
+以下保留早期探索性结果，便于追溯实验历史。表中的压缩率均相对于当次同模型、
+同数据集 CoT baseline 计算；它们尚未全部经过当前的跨切片与稳健成对审计。
 
 | Model | Dataset | Vector source | gamma | Accuracy | Avg tokens | Token compression |
 |---|---|---|---:|---:|---:|---:|
@@ -36,7 +45,9 @@ results/RESULT_SUMMARY.md
 | DeepSeek-R1-Distill-Qwen-7B | MATH | Author vector | 0.27 | 88.00% | 1774.40 | 24.5% |
 | DeepSeek-R1-Distill-Llama-8B | MATH | Author vector | 0.47 | 86.00% | 1810.80 | 26.3% |
 
-这些结果说明：原作者向量和自己重新提取的新向量都能在部分模型/数据集上带来有效压缩；其中新向量在 DeepSeek-R1-Distill-Qwen-7B 的 GSM8K 与 MATH 上表现比较稳定，Qwen3-8B 在官方 thinking-mode 设置下也已经出现可继续推进的压缩信号。
+这些结果曾提供压缩信号，但不能据此宣称新向量在
+DeepSeek-R1-Distill-Qwen-7B 上表现稳定。Qwen3-8B、MATH 与作者向量结果尚需按
+相同因果协议重新审计，在此之前均标记为 exploratory。
 
 完整结果见：
 

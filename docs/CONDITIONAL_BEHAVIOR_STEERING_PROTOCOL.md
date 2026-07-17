@@ -103,3 +103,21 @@ python select_causal_conciseness_vector.py \
 每个候选额外报告 `gate`，表示被判为 verbose 并实际注入的位置比例。如果三个候选
 均为 `null_result`，则停止对这个单一行为方向继续增加门控或调参，并将结论记录为：
 该方向可区分两类 teacher-forced 表示，但不足以对自由生成提供可泛化因果控制。
+
+## 实际结果与终止结论
+
+独立 train validation（seed 20260718）baseline 为 30/30、584.3 tokens：
+
+| alpha | gate | Accuracy | Avg tokens | Raw compression | 10% trimmed compression |
+|---:|---:|---:|---:|---:|---:|
+| 0.25 | 18.67% | 30/30 | 627.3 | -7.36% | 0.16% |
+| 0.50 | 21.79% | 28/30 | 645.1 | -10.41% | -0.33% |
+| 0.75 | 57.60% | 29/30 | 645.5 | -10.48% | 0.68% |
+
+三个 gate 都实际触发，排除“条件未命中”或 hook 未执行。raw mean 的部分恶化来自
+少数长链，但对 paired savings 做双侧 10% 截尾后，三个候选仍都约为 0%，没有
+稳健压缩。所有候选均为 `null_result`。
+
+因此本协议到此终止。不得继续在同一 test/development 数据上调整 gamma、alpha、
+符号或通过门槛。单一平均行为轨迹方向目前只能作为表示诊断量，不能声明为对自由
+生成简洁性的可泛化因果控制方向。
