@@ -33,6 +33,12 @@ results/**/*.tmp
 .vscode/
 .idea/
 
+# Upstream research snapshots without an explicit redistribution license.
+# Keep local copies for reading; use reference/ACTIVATION_ENGINEERING_2024_INDEX.md
+# for canonical source URLs and pinned provenance.
+reference/ACT-main/
+reference/kts-source/
+
 # OS files
 .DS_Store
 Thumbs.db
